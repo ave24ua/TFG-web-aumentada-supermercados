@@ -1,0 +1,804 @@
+// ==UserScript==
+// @name         Mercadona - Info nutricional (seleccionable) + Icono
+// @namespace    http://tampermonkey.net/
+// @version      1.4.0
+// @description  Icono de información por producto. Tooltip configurable con Nutri-Score, NOVA, aditivos, azúcares añadidos y nivel de sal (Open Food Facts) usando EAN (API Mercadona).
+// @match        https://tienda.mercadona.es/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+/* <---------------------> */
+/*           CONFIG        */
+/* <---------------------> */
+const Config = {
+  LANG: "es",
+  WAREHOUSE: "alc1",
+
+  // ----- URLs -----
+  MD_API_PRODUCT: (id) =>
+    `https://tienda.mercadona.es/api/products/${id}/?lang=${Config.LANG}&wh=${Config.WAREHOUSE}`,
+  OFF_API_PRODUCT: (ean) => `https://world.openfoodfacts.org/api/v2/product/${ean}.json`,
+
+  // ----- Selectores Mercadona -----
+  SELECTORS: {
+    productCards: ['[data-testid="product-cell"]', ".product-cell"],
+    name: ['[data-testid="product-cell-name"]', ".product-cell__description-name", "h4", "h3"],
+    price: ['[data-testid="product-price"]', ".product-price__unit-price"],
+    openDetailBtn: '[data-testid="open-product-detail"]',
+  },
+
+  // ----- UI -----
+  MUTATION_DEBOUNCE_MS: 250,
+  INDEXER_STEP_LIMIT: 2500,
+
+  // ----- Storage -----
+  STORAGE: {
+    optionsKey: "tm_md_tooltip_options_v1",
+  },
+
+  // Opciones disponibles para el menú / tooltip
+  OPTIONS: [
+    { key: "nutriscore", label: "Nutri-Score" },
+    { key: "nova", label: "NOVA (procesado)" },
+    { key: "additives", label: "Aditivos" },
+    { key: "added_sugars", label: "Azúcares añadidos" },
+    { key: "salt_level", label: "Nivel de sal" },
+  ],
+};
+
+/* <---------------------> */
+/*           STATE         */
+/* <---------------------> */
+const State = {
+  // Mercadona: id -> ean
+  eanById: new Map(),
+
+  // OFF: ean -> parsedData
+  offByEan: new Map(),
+
+  // "name|brand" -> id (aprendido del listado)
+  idByNameKey: new Map(),
+
+  // promesas en vuelo (dedupe)
+  inFlight: new Map(),
+
+  uiInjected: false,
+};
+
+/* <---------------------> */
+/*           UTILS         */
+/* <---------------------> */
+const Utils = {
+  /** Normaliza texto para comparaciones */
+  norm(s) {
+    return String(s || "")
+      .toLowerCase()
+      .replace(/[®™]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  },
+
+  /** Crea clave estable por nombre+marca */
+  nameKey(name, brand) {
+    return `${Utils.norm(name)}|${Utils.norm(brand || "")}`;
+  },
+
+  /** Escapa HTML para tooltip */
+  escapeHtml(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  },
+
+  /** Lee opciones seleccionadas desde localStorage (con defaults) */
+  getSelectedOptions() {
+    try {
+      const raw = localStorage.getItem(Config.STORAGE.optionsKey);
+      if (!raw) return Utils.defaultOptions();
+      const obj = JSON.parse(raw);
+      const out = {};
+      for (const opt of Config.OPTIONS) out[opt.key] = !!obj[opt.key];
+      return out;
+    } catch {
+      return Utils.defaultOptions();
+    }
+  },
+
+  /** Guarda opciones seleccionadas en localStorage */
+  setSelectedOptions(optionsObj) {
+    localStorage.setItem(Config.STORAGE.optionsKey, JSON.stringify(optionsObj));
+  },
+
+  /** Opciones por defecto */
+  defaultOptions() {
+    return {
+      nutriscore: true,
+      nova: true,
+      additives: true,
+      added_sugars: false,
+      salt_level: false,
+    };
+  },
+
+  /** Clasifica nivel de sal según umbrales simples (g/100g) */
+  saltLevelFromValue(salt100g) {
+    if (salt100g == null || Number.isNaN(salt100g)) return { level: null, text: "No disponible" };
+    const v = salt100g;
+    if (v <= 0.3) return { level: "bajo", text: `Bajo (${v.toFixed(2)} g/100g)` };
+    if (v <= 1.25) return { level: "medio", text: `Medio (${v.toFixed(2)} g/100g)` };
+    return { level: "alto", text: `Alto (${v.toFixed(2)} g/100g)` };
+  },
+
+  /** Determina si hay azúcares añadidos desde tags de OFF (heurística) */
+  addedSugarsFromTags(tags) {
+    const set = new Set((tags || []).map((t) => String(t).toLowerCase()));
+
+    if (set.has("en:no-added-sugars") || set.has("en:unsweetened")) return "Sin azúcares añadidos";
+    if (
+      set.has("en:added-sugars") ||
+      set.has("en:has-added-sugars") ||
+      set.has("en:sweetened") ||
+      set.has("en:with-added-sugars")
+    )
+      return "Con azúcares añadidos";
+
+    return "No determinado";
+  },
+};
+
+/* <---------------------> */
+/*         INDEXER         */
+/*  Aprende IDs del listado */
+/* <---------------------> */
+const Indexer = {
+  /** Engancha fetch para indexar respuestas JSON */
+  hookFetch() {
+    const origFetch = window.fetch;
+
+    window.fetch = async function (...args) {
+      const res = await origFetch.apply(this, args);
+
+      try {
+        const clone = res.clone();
+        clone
+          .json()
+          .then((json) => {
+            Indexer.indexIfProductDetail(json);
+            Indexer.indexProductsFromUnknownJson(json);
+          })
+          .catch(() => {});
+      } catch (_) {}
+
+      return res;
+    };
+  },
+
+  /** Indexa si el JSON parece el detalle (id+ean) */
+  indexIfProductDetail(json) {
+    if (!json || typeof json !== "object") return;
+    const id = json.id;
+    const ean = json.ean;
+    if (id && ean) {
+      State.eanById.set(String(id), String(ean));
+
+      const name = json.display_name || json.name;
+      const brand = json.brand;
+      if (name) State.idByNameKey.set(Utils.nameKey(name, brand), String(id));
+    }
+  },
+
+  /** Recorre JSON desconocido para capturar {id + name/display_name} */
+  indexProductsFromUnknownJson(json) {
+    const stack = [json];
+    let steps = 0;
+
+    while (stack.length && steps < Config.INDEXER_STEP_LIMIT) {
+      steps++;
+      const node = stack.pop();
+      if (!node) continue;
+
+      if (Array.isArray(node)) {
+        for (const it of node) stack.push(it);
+        continue;
+      }
+
+      if (typeof node !== "object") continue;
+
+      const id = node.id;
+      const name = node.display_name || node.name || node.title;
+      const brand = node.brand;
+
+      if (id && name) State.idByNameKey.set(Utils.nameKey(name, brand), String(id));
+
+      for (const k of Object.keys(node)) stack.push(node[k]);
+    }
+  },
+};
+
+/* <---------------------> */
+/*           API           */
+/* <---------------------> */
+const API = {
+  /** Pide EAN a Mercadona usando el id */
+  async getEanById(id) {
+    if (State.eanById.has(id)) return State.eanById.get(id);
+
+    const key = `ean_${id}`;
+    if (State.inFlight.has(key)) return State.inFlight.get(key);
+
+    const p = (async () => {
+      const res = await fetch(Config.MD_API_PRODUCT(id), { method: "GET" });
+      if (!res.ok) throw new Error("Mercadona API failed: " + res.status);
+      const json = await res.json();
+      const ean = json?.ean ? String(json.ean) : null;
+      if (ean) State.eanById.set(String(id), ean);
+
+      // Mejoramos índice nombre->id por si acaso
+      const n = json?.display_name || json?.name;
+      const b = json?.brand;
+      if (n && json?.id) State.idByNameKey.set(Utils.nameKey(n, b), String(json.id));
+
+      return ean;
+    })();
+
+    State.inFlight.set(key, p);
+    try {
+      return await p;
+    } finally {
+      State.inFlight.delete(key);
+    }
+  },
+
+  /** Pide datos a Open Food Facts y los “parsea” en un objeto sencillo */
+  async getOffDataByEan(ean) {
+    if (State.offByEan.has(ean)) return State.offByEan.get(ean);
+
+    const key = `off_${ean}`;
+    if (State.inFlight.has(key)) return State.inFlight.get(key);
+
+    const p = (async () => {
+      const res = await fetch(Config.OFF_API_PRODUCT(ean), { method: "GET" });
+      if (!res.ok) {
+        const outFail = {
+          nutriscoreGrade: null,
+          novaGroup: null,
+          additivesN: null,
+          addedSugarsText: "No disponible",
+          salt100g: null,
+          saltLevelText: "No disponible",
+          completeness: null,
+        };
+        State.offByEan.set(ean, outFail);
+        return outFail;
+      }
+
+      const json = await res.json();
+      const product = json?.product || null;
+
+      const nutriscoreGrade = product?.nutriscore_grade ? String(product.nutriscore_grade) : null;
+      const novaGroup = product?.nova_group != null ? Number(product.nova_group) : null;
+
+      const additivesN =
+        product?.additives_n != null
+          ? Number(product.additives_n)
+          : Array.isArray(product?.additives_tags)
+          ? product.additives_tags.length
+          : null;
+
+      const tags = product?.ingredients_analysis_tags || product?.ingredients_analysis || [];
+      const addedSugarsText = Utils.addedSugarsFromTags(tags);
+
+      const saltRaw =
+        product?.nutriments?.salt_100g != null ? product.nutriments.salt_100g : null;
+      const salt100g = saltRaw != null ? Number(saltRaw) : null;
+      const saltLevel = Utils.saltLevelFromValue(salt100g);
+
+      const completeness = product?.completeness != null ? Number(product.completeness) : null;
+
+      const out = {
+        nutriscoreGrade,
+        novaGroup,
+        additivesN,
+        addedSugarsText,
+        salt100g,
+        saltLevelText: saltLevel.text,
+        completeness,
+      };
+
+      State.offByEan.set(ean, out);
+      return out;
+    })();
+
+    State.inFlight.set(key, p);
+    try {
+      return await p;
+    } finally {
+      State.inFlight.delete(key);
+    }
+  },
+};
+
+/* <---------------------> */
+/*            UI           */
+/* <---------------------> */
+const UI = {
+  /** Inicializa menú, estilos y tooltip */
+  init() {
+    if (State.uiInjected) return;
+    State.uiInjected = true;
+
+    UI.injectMenu();
+    UI.injectStyles();
+    UI.ensureTooltip();
+  },
+
+  /** Inyecta menú de checkboxes */
+  injectMenu() {
+    if (document.getElementById("tm-md-wrapper")) return;
+
+    const wrapper = document.createElement("div");
+    wrapper.id = "tm-md-wrapper";
+
+    const btn = document.createElement("div");
+    btn.id = "tm-md-btn";
+    btn.textContent = "Info ▾";
+
+    const menu = document.createElement("div");
+    menu.id = "tm-md-menu";
+
+    const options = Utils.getSelectedOptions();
+
+    for (const opt of Config.OPTIONS) {
+      const row = document.createElement("label");
+      row.className = "tm-md-row";
+      row.setAttribute("for", `tm-md-opt-${opt.key}`);
+
+      const left = document.createElement("div");
+      left.className = "tm-md-left";
+
+      const text = document.createElement("span");
+      text.className = "tm-md-label";
+      text.textContent = opt.label;
+
+      left.appendChild(text);
+
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.id = `tm-md-opt-${opt.key}`;
+      checkbox.className = "tm-md-check";
+      checkbox.checked = !!options[opt.key];
+
+      checkbox.addEventListener("change", () => {
+        const current = Utils.getSelectedOptions();
+        current[opt.key] = checkbox.checked;
+        Utils.setSelectedOptions(current);
+      });
+
+      row.appendChild(left);
+      row.appendChild(checkbox);
+      menu.appendChild(row);
+    }
+
+    wrapper.appendChild(btn);
+    wrapper.appendChild(menu);
+    document.body.appendChild(wrapper);
+
+    btn.addEventListener("click", () => {
+      const open = menu.style.display === "block";
+      menu.style.display = open ? "none" : "block";
+      btn.textContent = open ? "Info ▾" : "Info ▴";
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!wrapper.contains(e.target)) {
+        menu.style.display = "none";
+        btn.textContent = "Info ▾";
+      }
+    });
+  },
+
+  /** Inyecta estilos CSS del menú, badge y tooltip */
+  injectStyles() {
+    if (document.getElementById("tm-md-style")) return;
+
+    const style = document.createElement("style");
+    style.id = "tm-md-style";
+    style.textContent = `
+      #tm-md-wrapper{
+        position: fixed; top: 16px; right: 16px; z-index: 999999;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      }
+      #tm-md-btn{
+        cursor: pointer; border: 1px solid rgba(0,0,0,0.15); background: white;
+        padding: 10px 12px; border-radius: 10px; box-shadow: 0 6px 18px rgba(0,0,0,0.12);
+        font-weight: 700; user-select: none;
+      }
+      #tm-md-menu{
+        margin-top: 10px; width: 260px; background: white; border: 1px solid rgba(0,0,0,0.12);
+        border-radius: 12px; box-shadow: 0 10px 28px rgba(0,0,0,0.16);
+        padding: 10px; display: none;
+      }
+      .tm-md-row{
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 8px 8px; border-radius: 10px; cursor: pointer;
+        gap: 10px;
+      }
+      .tm-md-row:hover{ background: rgba(0,0,0,0.05); }
+      .tm-md-left{ display:flex; align-items:center; gap:10px; }
+      .tm-md-label{ font-size: 14px; }
+      .tm-md-check{ cursor: pointer; }
+
+      /* ---- Badge: icono de información (neutral) ---- */
+      .tm-md-badge{
+        position: absolute; top: 10px; left: 10px;
+        width: 30px; height: 30px; border-radius: 999px;
+        border: 2px solid white;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+        z-index: 9999;
+        cursor: help;
+
+        background: rgba(255,255,255,0.92);
+
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .tm-md-badge svg{
+        width: 16px;
+        height: 16px;
+        display: block;
+        opacity: 0.85;
+        fill: rgba(0,0,0,0.82);
+      }
+
+      #tm-md-tooltip{
+        position: fixed; z-index: 1000000; display: none;
+        padding: 10px 12px; border-radius: 12px;
+        background: rgba(20,20,20,0.92); color: white;
+        box-shadow: 0 10px 28px rgba(0,0,0,0.28);
+        max-width: 340px;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+        font-size: 13px; line-height: 1.25;
+        pointer-events: none;
+      }
+      .tm-md-tip-title{ opacity: 0.92; margin-bottom: 6px; }
+      .tm-md-tip-line{ margin: 3px 0; }
+      .tm-md-tip-footer{ opacity: 0.75; margin-top: 8px; font-size: 12px; }
+      .tm-md-tip-warn{ opacity: 0.9; margin-top: 6px; font-size: 12px; }
+    `;
+    document.head.appendChild(style);
+  },
+
+  /** Crea tooltip si no existe */
+  ensureTooltip() {
+    if (document.getElementById("tm-md-tooltip")) return;
+    const t = document.createElement("div");
+    t.id = "tm-md-tooltip";
+    document.body.appendChild(t);
+  },
+
+  /** Muestra tooltip en coordenadas */
+  showTooltip(x, y, html) {
+    const t = document.getElementById("tm-md-tooltip");
+    if (!t) return;
+
+    t.innerHTML = html;
+    t.style.display = "block";
+
+    const offsetX = 14,
+      offsetY = 14;
+    const maxX = window.innerWidth - 360;
+    const maxY = window.innerHeight - 180;
+
+    t.style.left = Math.min(x + offsetX, maxX) + "px";
+    t.style.top = Math.min(y + offsetY, maxY) + "px";
+  },
+
+  /** Oculta tooltip */
+  hideTooltip() {
+    const t = document.getElementById("tm-md-tooltip");
+    if (t) t.style.display = "none";
+  },
+
+  /** Construye tooltip con líneas (solo lo marcado) */
+  tooltipHtml({ title, lines, footer, warn }) {
+    const safeTitle = Utils.escapeHtml(title);
+
+    const linesHtml = (lines || [])
+      .map((l) => `<div class="tm-md-tip-line">${Utils.escapeHtml(l)}</div>`)
+      .join("");
+
+    const footerHtml = footer ? `<div class="tm-md-tip-footer">${Utils.escapeHtml(footer)}</div>` : "";
+    const warnHtml = warn ? `<div class="tm-md-tip-warn">${Utils.escapeHtml(warn)}</div>` : "";
+
+    return `
+      <div class="tm-md-tip-title">${safeTitle}</div>
+      ${linesHtml || `<div class="tm-md-tip-line">No has seleccionado campos en el menú.</div>`}
+      ${warnHtml}
+      ${footerHtml}
+    `;
+  },
+};
+
+/* <---------------------> */
+/*          DOM/LOGIC      */
+/* <---------------------> */
+const Dom = {
+  /** Devuelve tarjetas de producto “válidas” */
+  findProductCards() {
+    const set = new Set();
+    for (const sel of Config.SELECTORS.productCards) {
+      document.querySelectorAll(sel).forEach((el) => set.add(el));
+    }
+
+    const out = [];
+    set.forEach((el) => {
+      const hasImg = !!el.querySelector("img");
+      const hasPrice = Config.SELECTORS.price.some((s) => !!el.querySelector(s));
+      const hasName = Config.SELECTORS.name.some((s) => !!el.querySelector(s));
+      if (hasImg && hasPrice && hasName) out.push(el);
+    });
+    return out;
+  },
+
+  /** Extrae nombre del producto */
+  getName(card) {
+    for (const sel of Config.SELECTORS.name) {
+      const el = card.querySelector(sel);
+      if (el) {
+        const txt = (el.textContent || "").trim().replace(/\s+/g, " ");
+        if (txt) return txt;
+      }
+    }
+    return "Producto";
+  },
+
+  /** Intenta inferir marca desde aria-label (si existe) */
+  getBrandHint(card) {
+    const aria = card.querySelector(Config.SELECTORS.openDetailBtn)?.getAttribute("aria-label") || "";
+    const m = aria.match(/^(Hacendado|Deliplus|Bosque Verde|Compy|Mercadona)\b/i);
+    return m ? m[1] : "";
+  },
+
+  /** Resuelve id: índice por nombre+marca o desde la URL de detalle */
+  resolveProductId(card) {
+    const name = Dom.getName(card);
+    const brand = Dom.getBrandHint(card);
+    const key = Utils.nameKey(name, brand);
+
+    if (State.idByNameKey.has(key)) return State.idByNameKey.get(key);
+
+    const m = location.pathname.match(/^\/product\/(\d+)\b/);
+    if (m) return m[1];
+
+    return null;
+  },
+};
+
+/* <---------------------> */
+/*           BADGES        */
+/* <---------------------> */
+const Badges = {
+  /** Arranca repintado y observer SPA */
+  init() {
+    Badges.repaint();
+
+    let timer = null;
+    const obs = new MutationObserver(() => {
+      clearTimeout(timer);
+      timer = setTimeout(Badges.repaint, Config.MUTATION_DEBOUNCE_MS);
+    });
+    obs.observe(document.body, { childList: true, subtree: true });
+  },
+
+  /** Asegura un badge por tarjeta */
+  repaint() {
+    const cards = Dom.findProductCards();
+    for (const card of cards) Badges.ensureBadge(card);
+  },
+
+  /** Inserta badge si no existe y engancha hover */
+  ensureBadge(card) {
+    const cs = window.getComputedStyle(card);
+    if (cs.position === "static") card.style.position = "relative";
+
+    let badge = card.querySelector(":scope > .tm-md-badge");
+    if (!badge) {
+      badge = document.createElement("div");
+      badge.className = "tm-md-badge";
+
+      // Icono "info" neutral (SVG embebido, sin librerías)
+      badge.innerHTML = `
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10
+                   10-4.48 10-10S17.52 2 12 2zm0 4a1.25 1.25 0 110 2.5A1.25 1.25 0 0112 6zm1.5 12h-3v-1.5h1.5V11h-1.5V9.5h3V16.5h1.5V18z"/>
+        </svg>
+      `;
+
+      card.prepend(badge);
+      Badges.attachHover(badge, card);
+    }
+  },
+
+  /** Define el comportamiento hover (según checkboxes) */
+  attachHover(badge, card) {
+    // Cierre robusto (evita tooltip “pegado”)
+    const stopTracking = () => {
+      UI.hideTooltip();
+      if (badge._tmOnMove) document.removeEventListener("mousemove", badge._tmOnMove);
+      badge._tmOnMove = null;
+    };
+
+    // Mantiene tooltip pegado al cursor SOLO si seguimos hover sobre el badge
+    const onMove = (ev) => {
+      if (!badge.matches(":hover")) {
+        stopTracking();
+        return;
+      }
+      const t = document.getElementById("tm-md-tooltip");
+      if (t && t.style.display === "block") UI.showTooltip(ev.clientX, ev.clientY, t.innerHTML);
+    };
+
+    // Cierra también en scroll / cambio de pestaña (SPA)
+    const onScroll = () => stopTracking();
+    const onVis = () => {
+      if (document.hidden) stopTracking();
+    };
+
+    badge.addEventListener("mouseenter", async (ev) => {
+      // Nos aseguramos de limpiar cualquier estado previo
+      stopTracking();
+
+      const name = Dom.getName(card);
+      const options = Utils.getSelectedOptions();
+
+      UI.showTooltip(
+        ev.clientX,
+        ev.clientY,
+        UI.tooltipHtml({
+          title: name,
+          lines: ["Cargando…"],
+          footer: "",
+        })
+      );
+
+      const id = Dom.resolveProductId(card);
+      if (!id) {
+        UI.showTooltip(
+          ev.clientX,
+          ev.clientY,
+          UI.tooltipHtml({
+            title: name,
+            lines: [],
+            warn: "Aún no tengo el ID de este producto (prueba a hacer scroll o cambiar de categoría).",
+            footer: "",
+          })
+        );
+        document.addEventListener("mousemove", onMove);
+        badge._tmOnMove = onMove;
+
+        window.addEventListener("scroll", onScroll, true);
+        document.addEventListener("visibilitychange", onVis);
+        badge._tmOnScroll = onScroll;
+        badge._tmOnVis = onVis;
+        return;
+      }
+
+      try {
+        const ean = await API.getEanById(id);
+        if (!ean) {
+          UI.showTooltip(
+            ev.clientX,
+            ev.clientY,
+            UI.tooltipHtml({
+              title: name,
+              lines: [],
+              warn: "No se pudo obtener el EAN.",
+              footer: `ID: ${id}`,
+            })
+          );
+          document.addEventListener("mousemove", onMove);
+          badge._tmOnMove = onMove;
+
+          window.addEventListener("scroll", onScroll, true);
+          document.addEventListener("visibilitychange", onVis);
+          badge._tmOnScroll = onScroll;
+          badge._tmOnVis = onVis;
+          return;
+        }
+
+        const off = await API.getOffDataByEan(ean);
+
+        // Construimos líneas SOLO con lo marcado
+        const lines = [];
+
+        if (options.nutriscore) {
+          const grade = off.nutriscoreGrade ? off.nutriscoreGrade.toUpperCase() : "No disponible";
+          lines.push(`Nutri-Score: ${grade}`);
+        }
+
+        if (options.nova) {
+          lines.push(`NOVA: ${off.novaGroup != null ? off.novaGroup : "No disponible"}`);
+        }
+
+        if (options.additives) {
+          lines.push(`Aditivos: ${off.additivesN != null ? off.additivesN : "No disponible"}`);
+        }
+
+        if (options.added_sugars) {
+          lines.push(`Azúcares añadidos: ${off.addedSugarsText || "No disponible"}`);
+        }
+
+        if (options.salt_level) {
+          lines.push(`Nivel de sal: ${off.saltLevelText || "No disponible"}`);
+        }
+
+        // Aviso si OFF tiene baja “completitud”
+        let warn = "";
+        if (off.completeness != null && off.completeness < 0.4) {
+          warn = "Datos incompletos en Open Food Facts (puede faltar información).";
+        }
+
+        UI.showTooltip(
+          ev.clientX,
+          ev.clientY,
+          UI.tooltipHtml({
+            title: name,
+            lines,
+            warn,
+            footer: `EAN: ${ean}`,
+          })
+        );
+      } catch (e) {
+        UI.showTooltip(
+          ev.clientX,
+          ev.clientY,
+          UI.tooltipHtml({
+            title: name,
+            lines: [],
+            warn: "Error consultando datos (puede ser temporal).",
+            footer: "",
+          })
+        );
+      }
+
+      // Tracking robusto para evitar tooltip “pegado”
+      document.addEventListener("mousemove", onMove);
+      badge._tmOnMove = onMove;
+
+      window.addEventListener("scroll", onScroll, true);
+      document.addEventListener("visibilitychange", onVis);
+      badge._tmOnScroll = onScroll;
+      badge._tmOnVis = onVis;
+    });
+
+    badge.addEventListener("mouseleave", () => {
+      stopTracking();
+      if (badge._tmOnScroll) window.removeEventListener("scroll", badge._tmOnScroll, true);
+      if (badge._tmOnVis) document.removeEventListener("visibilitychange", badge._tmOnVis);
+      badge._tmOnScroll = null;
+      badge._tmOnVis = null;
+    });
+  },
+};
+
+/* <---------------------> */
+/*            MAIN         */
+/* <---------------------> */
+const Main = {
+  /** Punto de entrada: engancha fetch y arranca UI/Badges al cargar DOM */
+  init() {
+    Indexer.hookFetch();
+
+    document.addEventListener("DOMContentLoaded", () => {
+      UI.init();
+      Badges.init();
+    });
+  },
+};
+
+Main.init();
