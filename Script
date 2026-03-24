@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mercadona - Info nutricional visual + filtros por Nutri-Score
 // @namespace    http://tampermonkey.net/
-// @version      1.7.0
+// @version      1.7.1
 // @description  Icono de información por producto. Tooltip visual con Nutri-Score, NOVA, aditivos, azúcares añadidos y nivel de sal. Filtro visual por Nutri-Score con estados de carga.
 // @match        https://tienda.mercadona.es/*
 // @run-at       document-start
@@ -32,7 +32,7 @@ const Config = {
 
   STORAGE: {
     infoOptionsKey: "tm_md_tooltip_options_v4",
-    filterOptionsKey: "tm_md_filter_options_v2",
+    filterOptionsKey: "tm_md_filter_options_v3",
   },
 
   INFO_OPTIONS: [
@@ -168,6 +168,7 @@ const Utils = {
       return {
         threshold: obj?.threshold || "none",
         mode: obj?.mode || "mark",
+        hideUnknown: !!obj?.hideUnknown,
       };
     } catch {
       return Utils.defaultFilterOptions();
@@ -182,6 +183,7 @@ const Utils = {
     return {
       threshold: "none",
       mode: "mark",
+      hideUnknown: false,
     };
   },
 
@@ -606,6 +608,36 @@ const UI = {
     modeRow.appendChild(modeLabel);
     modeRow.appendChild(modeSelect);
     menu.appendChild(modeRow);
+
+    const hideUnknownRow = document.createElement("label");
+    hideUnknownRow.className = "tm-md-row";
+    hideUnknownRow.setAttribute("for", "tm-md-hide-unknown");
+
+    const hideUnknownLeft = document.createElement("div");
+    hideUnknownLeft.className = "tm-md-left";
+
+    const hideUnknownText = document.createElement("span");
+    hideUnknownText.className = "tm-md-label";
+    hideUnknownText.textContent = "ocultar alimentos sin información";
+
+    hideUnknownLeft.appendChild(hideUnknownText);
+
+    const hideUnknownCheckbox = document.createElement("input");
+    hideUnknownCheckbox.type = "checkbox";
+    hideUnknownCheckbox.id = "tm-md-hide-unknown";
+    hideUnknownCheckbox.className = "tm-md-check";
+    hideUnknownCheckbox.checked = !!filterOptions.hideUnknown;
+
+    hideUnknownCheckbox.addEventListener("change", () => {
+      const current = Utils.getFilterOptions();
+      current.hideUnknown = hideUnknownCheckbox.checked;
+      Utils.setFilterOptions(current);
+      Filters.reapplyAll();
+    });
+
+    hideUnknownRow.appendChild(hideUnknownLeft);
+    hideUnknownRow.appendChild(hideUnknownCheckbox);
+    menu.appendChild(hideUnknownRow);
 
     const note = document.createElement("div");
     note.className = "tm-md-note";
@@ -1195,8 +1227,12 @@ const Filters = {
     Filters.clearCard(card);
 
     if (!["a", "b", "c", "d", "e"].includes(realGrade)) {
-      card.classList.add("tm-md-unknown");
-      Filters.ensureUnknownLabel(card);
+      if (filterOptions.hideUnknown) {
+        card.classList.add("tm-md-hidden");
+      } else {
+        card.classList.add("tm-md-unknown");
+        Filters.ensureUnknownLabel(card);
+      }
       return;
     }
 
