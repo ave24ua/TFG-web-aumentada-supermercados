@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Mercadona - Info nutricional (seleccionable) + Icono
+// @name         Mercadona - Info nutricional visual + filtros por Nutri-Score
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
-// @description  Icono de información por producto. Tooltip configurable con Nutri-Score, NOVA, aditivos, azúcares añadidos y nivel de sal (Open Food Facts) usando EAN (API Mercadona).
+// @version      1.7.0
+// @description  Icono de información por producto. Tooltip visual con Nutri-Score, NOVA, aditivos, azúcares añadidos y nivel de sal. Filtro visual por Nutri-Score con estados de carga.
 // @match        https://tienda.mercadona.es/*
 // @run-at       document-start
 // @grant        none
@@ -15,12 +15,10 @@ const Config = {
   LANG: "es",
   WAREHOUSE: "alc1",
 
-  // ----- URLs -----
   MD_API_PRODUCT: (id) =>
     `https://tienda.mercadona.es/api/products/${id}/?lang=${Config.LANG}&wh=${Config.WAREHOUSE}`,
   OFF_API_PRODUCT: (ean) => `https://world.openfoodfacts.org/api/v2/product/${ean}.json`,
 
-  // ----- Selectores Mercadona -----
   SELECTORS: {
     productCards: ['[data-testid="product-cell"]', ".product-cell"],
     name: ['[data-testid="product-cell-name"]', ".product-cell__description-name", "h4", "h3"],
@@ -28,22 +26,34 @@ const Config = {
     openDetailBtn: '[data-testid="open-product-detail"]',
   },
 
-  // ----- UI -----
   MUTATION_DEBOUNCE_MS: 250,
   INDEXER_STEP_LIMIT: 2500,
+  FILTER_CONCURRENCY: 4,
 
-  // ----- Storage -----
   STORAGE: {
-    optionsKey: "tm_md_tooltip_options_v1",
+    infoOptionsKey: "tm_md_tooltip_options_v4",
+    filterOptionsKey: "tm_md_filter_options_v2",
   },
 
-  // Opciones disponibles para el menú / tooltip
-  OPTIONS: [
+  INFO_OPTIONS: [
     { key: "nutriscore", label: "Nutri-Score" },
     { key: "nova", label: "NOVA (procesado)" },
     { key: "additives", label: "Aditivos" },
     { key: "added_sugars", label: "Azúcares añadidos" },
     { key: "salt_level", label: "Nivel de sal" },
+  ],
+
+  FILTER_THRESHOLDS: [
+    { value: "none", label: "Sin filtro" },
+    { value: "a", label: "Solo A" },
+    { value: "b", label: "B o mejor" },
+    { value: "c", label: "C o mejor" },
+    { value: "d", label: "D o mejor" },
+  ],
+
+  FILTER_MODES: [
+    { value: "mark", label: "Remarcar en rojo" },
+    { value: "hide", label: "Ocultar" },
   ],
 };
 
@@ -51,26 +61,36 @@ const Config = {
 /*           STATE         */
 /* <---------------------> */
 const State = {
-  // Mercadona: id -> ean
   eanById: new Map(),
-
-  // OFF: ean -> parsedData
   offByEan: new Map(),
-
-  // "name|brand" -> id (aprendido del listado)
   idByNameKey: new Map(),
-
-  // promesas en vuelo (dedupe)
   inFlight: new Map(),
 
   uiInjected: false,
+
+  filterQueue: [],
+  filterQueueSet: new Set(),
+  filterWorkerActive: 0,
+};
+
+/* <---------------------> */
+/*          RUNTIME        */
+/* <---------------------> */
+const Runtime = {
+  reapplyTimer: null,
+
+  scheduleReapplyFilters() {
+    clearTimeout(Runtime.reapplyTimer);
+    Runtime.reapplyTimer = setTimeout(() => {
+      Filters.reapplyAll();
+    }, 250);
+  },
 };
 
 /* <---------------------> */
 /*           UTILS         */
 /* <---------------------> */
 const Utils = {
-  /** Normaliza texto para comparaciones */
   norm(s) {
     return String(s || "")
       .toLowerCase()
@@ -79,12 +99,10 @@ const Utils = {
       .trim();
   },
 
-  /** Crea clave estable por nombre+marca */
   nameKey(name, brand) {
     return `${Utils.norm(name)}|${Utils.norm(brand || "")}`;
   },
 
-  /** Escapa HTML para tooltip */
   escapeHtml(s) {
     return String(s)
       .replaceAll("&", "&amp;")
@@ -94,46 +112,90 @@ const Utils = {
       .replaceAll("'", "&#039;");
   },
 
-  /** Lee opciones seleccionadas desde localStorage (con defaults) */
-  getSelectedOptions() {
+  normalizeDisplayValue(value) {
+    if (value == null) return "No disponible";
+    const s = String(value).trim();
+    if (!s) return "No disponible";
+
+    const normalized = s.toLowerCase();
+    if (
+      normalized === "unknown" ||
+      normalized === "no determinado" ||
+      normalized === "no disponible" ||
+      normalized === "not available" ||
+      normalized === "n/a" ||
+      normalized === "null" ||
+      normalized === "undefined"
+    ) {
+      return "No disponible";
+    }
+
+    return s;
+  },
+
+  getSelectedInfoOptions() {
     try {
-      const raw = localStorage.getItem(Config.STORAGE.optionsKey);
-      if (!raw) return Utils.defaultOptions();
+      const raw = localStorage.getItem(Config.STORAGE.infoOptionsKey);
+      if (!raw) return Utils.defaultInfoOptions();
       const obj = JSON.parse(raw);
       const out = {};
-      for (const opt of Config.OPTIONS) out[opt.key] = !!obj[opt.key];
+      for (const opt of Config.INFO_OPTIONS) out[opt.key] = !!obj[opt.key];
       return out;
     } catch {
-      return Utils.defaultOptions();
+      return Utils.defaultInfoOptions();
     }
   },
 
-  /** Guarda opciones seleccionadas en localStorage */
-  setSelectedOptions(optionsObj) {
-    localStorage.setItem(Config.STORAGE.optionsKey, JSON.stringify(optionsObj));
+  setSelectedInfoOptions(optionsObj) {
+    localStorage.setItem(Config.STORAGE.infoOptionsKey, JSON.stringify(optionsObj));
   },
 
-  /** Opciones por defecto */
-  defaultOptions() {
+  defaultInfoOptions() {
     return {
       nutriscore: true,
       nova: true,
       additives: true,
-      added_sugars: false,
-      salt_level: false,
+      added_sugars: true,
+      salt_level: true,
     };
   },
 
-  /** Clasifica nivel de sal según umbrales simples (g/100g) */
+  getFilterOptions() {
+    try {
+      const raw = localStorage.getItem(Config.STORAGE.filterOptionsKey);
+      if (!raw) return Utils.defaultFilterOptions();
+      const obj = JSON.parse(raw);
+      return {
+        threshold: obj?.threshold || "none",
+        mode: obj?.mode || "mark",
+      };
+    } catch {
+      return Utils.defaultFilterOptions();
+    }
+  },
+
+  setFilterOptions(optionsObj) {
+    localStorage.setItem(Config.STORAGE.filterOptionsKey, JSON.stringify(optionsObj));
+  },
+
+  defaultFilterOptions() {
+    return {
+      threshold: "none",
+      mode: "mark",
+    };
+  },
+
   saltLevelFromValue(salt100g) {
-    if (salt100g == null || Number.isNaN(salt100g)) return { level: null, text: "No disponible" };
+    if (salt100g == null || Number.isNaN(salt100g)) {
+      return { level: null, text: "No disponible" };
+    }
+
     const v = salt100g;
     if (v <= 0.3) return { level: "bajo", text: `Bajo (${v.toFixed(2)} g/100g)` };
     if (v <= 1.25) return { level: "medio", text: `Medio (${v.toFixed(2)} g/100g)` };
     return { level: "alto", text: `Alto (${v.toFixed(2)} g/100g)` };
   },
 
-  /** Determina si hay azúcares añadidos desde tags de OFF (heurística) */
   addedSugarsFromTags(tags) {
     const set = new Set((tags || []).map((t) => String(t).toLowerCase()));
 
@@ -143,19 +205,64 @@ const Utils = {
       set.has("en:has-added-sugars") ||
       set.has("en:sweetened") ||
       set.has("en:with-added-sugars")
-    )
+    ) {
       return "Con azúcares añadidos";
+    }
 
-    return "No determinado";
+    return "No disponible";
+  },
+
+  nutriValue(grade) {
+    const map = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+    return map[String(grade || "").toLowerCase()] || null;
+  },
+
+  passesNutriThreshold(grade, threshold) {
+    if (!threshold || threshold === "none") return true;
+    const g = Utils.nutriValue(grade);
+    const t = Utils.nutriValue(threshold);
+    if (g == null || t == null) return true;
+    return g <= t;
+  },
+
+  formatNovaGroup(novaGroup) {
+    if (novaGroup == null || Number.isNaN(novaGroup)) return "No disponible";
+    return `Grupo ${novaGroup}`;
+  },
+
+  formatAdditivesCount(n) {
+    if (n == null || Number.isNaN(n)) return "No disponible";
+    return `${n}`;
+  },
+
+  formatAddedSugars(text) {
+    const normalized = Utils.normalizeDisplayValue(text);
+    if (normalized === "Sin azúcares añadidos") return "Sin añadidos";
+    if (normalized === "Con azúcares añadidos") return "Con añadidos";
+    return "No disponible";
+  },
+
+  formatSaltLevel(text) {
+    return Utils.normalizeDisplayValue(text);
+  },
+
+  nutriColor(letter) {
+    const l = String(letter || "").toLowerCase();
+    const map = {
+      a: "#1e8f4d",
+      b: "#6dbd45",
+      c: "#f2c94c",
+      d: "#f2994a",
+      e: "#d64545",
+    };
+    return map[l] || "#6b7280";
   },
 };
 
 /* <---------------------> */
 /*         INDEXER         */
-/*  Aprende IDs del listado */
 /* <---------------------> */
 const Indexer = {
-  /** Engancha fetch para indexar respuestas JSON */
   hookFetch() {
     const origFetch = window.fetch;
 
@@ -177,7 +284,6 @@ const Indexer = {
     };
   },
 
-  /** Indexa si el JSON parece el detalle (id+ean) */
   indexIfProductDetail(json) {
     if (!json || typeof json !== "object") return;
     const id = json.id;
@@ -187,11 +293,13 @@ const Indexer = {
 
       const name = json.display_name || json.name;
       const brand = json.brand;
-      if (name) State.idByNameKey.set(Utils.nameKey(name, brand), String(id));
+      if (name) {
+        State.idByNameKey.set(Utils.nameKey(name, brand), String(id));
+        Runtime.scheduleReapplyFilters();
+      }
     }
   },
 
-  /** Recorre JSON desconocido para capturar {id + name/display_name} */
   indexProductsFromUnknownJson(json) {
     const stack = [json];
     let steps = 0;
@@ -212,7 +320,13 @@ const Indexer = {
       const name = node.display_name || node.name || node.title;
       const brand = node.brand;
 
-      if (id && name) State.idByNameKey.set(Utils.nameKey(name, brand), String(id));
+      if (id && name) {
+        const key = Utils.nameKey(name, brand);
+        if (!State.idByNameKey.has(key)) {
+          State.idByNameKey.set(key, String(id));
+          Runtime.scheduleReapplyFilters();
+        }
+      }
 
       for (const k of Object.keys(node)) stack.push(node[k]);
     }
@@ -220,10 +334,9 @@ const Indexer = {
 };
 
 /* <---------------------> */
-/*           API           */
+/*            API          */
 /* <---------------------> */
 const API = {
-  /** Pide EAN a Mercadona usando el id */
   async getEanById(id) {
     if (State.eanById.has(id)) return State.eanById.get(id);
 
@@ -233,11 +346,11 @@ const API = {
     const p = (async () => {
       const res = await fetch(Config.MD_API_PRODUCT(id), { method: "GET" });
       if (!res.ok) throw new Error("Mercadona API failed: " + res.status);
+
       const json = await res.json();
       const ean = json?.ean ? String(json.ean) : null;
       if (ean) State.eanById.set(String(id), ean);
 
-      // Mejoramos índice nombre->id por si acaso
       const n = json?.display_name || json?.name;
       const b = json?.brand;
       if (n && json?.id) State.idByNameKey.set(Utils.nameKey(n, b), String(json.id));
@@ -253,7 +366,6 @@ const API = {
     }
   },
 
-  /** Pide datos a Open Food Facts y los “parsea” en un objeto sencillo */
   async getOffDataByEan(ean) {
     if (State.offByEan.has(ean)) return State.offByEan.get(ean);
 
@@ -262,9 +374,10 @@ const API = {
 
     const p = (async () => {
       const res = await fetch(Config.OFF_API_PRODUCT(ean), { method: "GET" });
+
       if (!res.ok) {
         const outFail = {
-          nutriscoreGrade: null,
+          nutriscoreGrade: "No disponible",
           novaGroup: null,
           additivesN: null,
           addedSugarsText: "No disponible",
@@ -279,7 +392,9 @@ const API = {
       const json = await res.json();
       const product = json?.product || null;
 
-      const nutriscoreGrade = product?.nutriscore_grade ? String(product.nutriscore_grade) : null;
+      const nutriscoreGrade = Utils.normalizeDisplayValue(
+        product?.nutriscore_grade ? String(product.nutriscore_grade) : null
+      );
       const novaGroup = product?.nova_group != null ? Number(product.nova_group) : null;
 
       const additivesN =
@@ -290,7 +405,7 @@ const API = {
           : null;
 
       const tags = product?.ingredients_analysis_tags || product?.ingredients_analysis || [];
-      const addedSugarsText = Utils.addedSugarsFromTags(tags);
+      const addedSugarsText = Utils.normalizeDisplayValue(Utils.addedSugarsFromTags(tags));
 
       const saltRaw =
         product?.nutriments?.salt_100g != null ? product.nutriments.salt_100g : null;
@@ -305,7 +420,7 @@ const API = {
         additivesN,
         addedSugarsText,
         salt100g,
-        saltLevelText: saltLevel.text,
+        saltLevelText: Utils.normalizeDisplayValue(saltLevel.text),
         completeness,
       };
 
@@ -323,10 +438,46 @@ const API = {
 };
 
 /* <---------------------> */
+/*         ICONS           */
+/* <---------------------> */
+const Icons = {
+  info: `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10
+               10-4.48 10-10S17.52 2 12 2zm0 4a1.25 1.25 0 110 2.5A1.25 1.25 0 0112 6zm1.5 12h-3v-1.5h1.5V11h-1.5V9.5h3V16.5h1.5V18z"/>
+    </svg>
+  `,
+  nova: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3c3.5 2.4 6 5.3 6 9a6 6 0 11-12 0c0-3.7 2.5-6.6 6-9zm0 3.1C9.8 8 8.5 10 8.5 12A3.5 3.5 0 0012 15.5 3.5 3.5 0 0015.5 12c0-2-1.3-4-3.5-5.9z"/>
+    </svg>
+  `,
+  additives: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M7 3h10v2h-1v4.17l2.59 2.58A2 2 0 0119 13.17V19a2 2 0 01-2 2H7a2 2 0 01-2-2v-5.83a2 2 0 01.41-1.22L8 9.17V5H7V3zm3 2v4.83L7.41 12.4A.5.5 0 007.3 12.7V19a.5.5 0 00.5.5h8.4a.5.5 0 00.5-.5v-6.3a.5.5 0 00-.11-.3L14 9.83V5h-4z"/>
+    </svg>
+  `,
+  sugar: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M8.5 4h7l3.5 5-7 11-7-11 3.5-5zm1.3 2L8 8.6l4 6.3 4-6.3L14.2 6H9.8z"/>
+    </svg>
+  `,
+  salt: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M9 4a3 3 0 116 0c0 1.6-.8 2.6-1.7 3.6-.7.8-1.3 1.5-1.3 2.4V11h5v8a2 2 0 01-2 2H9a2 2 0 01-2-2v-8h5V10c0-.9-.6-1.6-1.3-2.4C9.8 6.6 9 5.6 9 4zm3-1.5A1.5 1.5 0 0010.5 4c0 1 .5 1.6 1.3 2.5.1.1.1.1.2.2.1-.1.1-.1.2-.2.8-.9 1.3-1.5 1.3-2.5A1.5 1.5 0 0012 2.5z"/>
+    </svg>
+  `,
+  spinner: `
+    <svg viewBox="0 0 50 50" aria-hidden="true" class="tm-md-spinner-svg">
+      <circle cx="25" cy="25" r="18" fill="none" stroke-width="4" stroke-linecap="round"></circle>
+    </svg>
+  `,
+};
+
+/* <---------------------> */
 /*            UI           */
 /* <---------------------> */
 const UI = {
-  /** Inicializa menú, estilos y tooltip */
   init() {
     if (State.uiInjected) return;
     State.uiInjected = true;
@@ -336,7 +487,6 @@ const UI = {
     UI.ensureTooltip();
   },
 
-  /** Inyecta menú de checkboxes */
   injectMenu() {
     if (document.getElementById("tm-md-wrapper")) return;
 
@@ -350,9 +500,14 @@ const UI = {
     const menu = document.createElement("div");
     menu.id = "tm-md-menu";
 
-    const options = Utils.getSelectedOptions();
+    const infoTitle = document.createElement("div");
+    infoTitle.className = "tm-md-section-title";
+    infoTitle.textContent = "Campos del tooltip";
+    menu.appendChild(infoTitle);
 
-    for (const opt of Config.OPTIONS) {
+    const infoOptions = Utils.getSelectedInfoOptions();
+
+    for (const opt of Config.INFO_OPTIONS) {
       const row = document.createElement("label");
       row.className = "tm-md-row";
       row.setAttribute("for", `tm-md-opt-${opt.key}`);
@@ -370,18 +525,92 @@ const UI = {
       checkbox.type = "checkbox";
       checkbox.id = `tm-md-opt-${opt.key}`;
       checkbox.className = "tm-md-check";
-      checkbox.checked = !!options[opt.key];
+      checkbox.checked = !!infoOptions[opt.key];
 
       checkbox.addEventListener("change", () => {
-        const current = Utils.getSelectedOptions();
+        const current = Utils.getSelectedInfoOptions();
         current[opt.key] = checkbox.checked;
-        Utils.setSelectedOptions(current);
+        Utils.setSelectedInfoOptions(current);
       });
 
       row.appendChild(left);
       row.appendChild(checkbox);
       menu.appendChild(row);
     }
+
+    const separator = document.createElement("div");
+    separator.className = "tm-md-separator";
+    menu.appendChild(separator);
+
+    const filterTitle = document.createElement("div");
+    filterTitle.className = "tm-md-section-title";
+    filterTitle.textContent = "Filtro visual por Nutri-Score";
+    menu.appendChild(filterTitle);
+
+    const filterOptions = Utils.getFilterOptions();
+
+    const thresholdRow = document.createElement("div");
+    thresholdRow.className = "tm-md-control";
+
+    const thresholdLabel = document.createElement("label");
+    thresholdLabel.className = "tm-md-control-label";
+    thresholdLabel.textContent = "Mostrar productos";
+
+    const thresholdSelect = document.createElement("select");
+    thresholdSelect.className = "tm-md-select";
+
+    for (const item of Config.FILTER_THRESHOLDS) {
+      const option = document.createElement("option");
+      option.value = item.value;
+      option.textContent = item.label;
+      option.selected = filterOptions.threshold === item.value;
+      thresholdSelect.appendChild(option);
+    }
+
+    thresholdSelect.addEventListener("change", () => {
+      const current = Utils.getFilterOptions();
+      current.threshold = thresholdSelect.value;
+      Utils.setFilterOptions(current);
+      Filters.reapplyAll();
+    });
+
+    thresholdRow.appendChild(thresholdLabel);
+    thresholdRow.appendChild(thresholdSelect);
+    menu.appendChild(thresholdRow);
+
+    const modeRow = document.createElement("div");
+    modeRow.className = "tm-md-control";
+
+    const modeLabel = document.createElement("label");
+    modeLabel.className = "tm-md-control-label";
+    modeLabel.textContent = "Acción";
+
+    const modeSelect = document.createElement("select");
+    modeSelect.className = "tm-md-select";
+
+    for (const item of Config.FILTER_MODES) {
+      const option = document.createElement("option");
+      option.value = item.value;
+      option.textContent = item.label;
+      option.selected = filterOptions.mode === item.value;
+      modeSelect.appendChild(option);
+    }
+
+    modeSelect.addEventListener("change", () => {
+      const current = Utils.getFilterOptions();
+      current.mode = modeSelect.value;
+      Utils.setFilterOptions(current);
+      Filters.reapplyAll();
+    });
+
+    modeRow.appendChild(modeLabel);
+    modeRow.appendChild(modeSelect);
+    menu.appendChild(modeRow);
+
+    const note = document.createElement("div");
+    note.className = "tm-md-note";
+    note.textContent = "Los productos se cargan y actualizan automáticamente, sin pasar el ratón.";
+    menu.appendChild(note);
 
     wrapper.appendChild(btn);
     wrapper.appendChild(menu);
@@ -401,7 +630,6 @@ const UI = {
     });
   },
 
-  /** Inyecta estilos CSS del menú, badge y tooltip */
   injectStyles() {
     if (document.getElementById("tm-md-style")) return;
 
@@ -418,9 +646,20 @@ const UI = {
         font-weight: 700; user-select: none;
       }
       #tm-md-menu{
-        margin-top: 10px; width: 260px; background: white; border: 1px solid rgba(0,0,0,0.12);
+        margin-top: 10px; width: 290px; background: white; border: 1px solid rgba(0,0,0,0.12);
         border-radius: 12px; box-shadow: 0 10px 28px rgba(0,0,0,0.16);
         padding: 10px; display: none;
+      }
+      .tm-md-section-title{
+        font-size: 13px;
+        font-weight: 700;
+        margin: 4px 2px 8px 2px;
+        opacity: 0.85;
+      }
+      .tm-md-separator{
+        height: 1px;
+        background: rgba(0,0,0,0.08);
+        margin: 10px 0;
       }
       .tm-md-row{
         display: flex; align-items: center; justify-content: space-between;
@@ -431,49 +670,292 @@ const UI = {
       .tm-md-left{ display:flex; align-items:center; gap:10px; }
       .tm-md-label{ font-size: 14px; }
       .tm-md-check{ cursor: pointer; }
+      .tm-md-control{
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 8px 8px;
+      }
+      .tm-md-control-label{
+        font-size: 13px;
+        opacity: 0.9;
+      }
+      .tm-md-select{
+        height: 34px;
+        border: 1px solid rgba(0,0,0,0.15);
+        border-radius: 8px;
+        padding: 0 10px;
+        background: white;
+      }
+      .tm-md-note{
+        font-size: 12px;
+        opacity: 0.7;
+        padding: 6px 8px 2px 8px;
+        line-height: 1.3;
+      }
 
-      /* ---- Badge: icono de información (neutral) ---- */
       .tm-md-badge{
         position: absolute; top: 10px; left: 10px;
-        width: 30px; height: 30px; border-radius: 999px;
+        width: 32px; height: 32px; border-radius: 999px;
         border: 2px solid white;
         box-shadow: 0 4px 14px rgba(0,0,0,0.18);
         z-index: 9999;
         cursor: help;
-
-        background: rgba(255,255,255,0.92);
-
+        background: rgba(255,255,255,0.96);
         display: flex;
         align-items: center;
         justify-content: center;
+        backdrop-filter: blur(2px);
       }
       .tm-md-badge svg{
-        width: 16px;
-        height: 16px;
+        width: 18px;
+        height: 18px;
         display: block;
-        opacity: 0.85;
+        opacity: 0.9;
         fill: rgba(0,0,0,0.82);
+      }
+
+      .tm-md-muted{
+        filter: grayscale(1);
+        opacity: 0.40 !important;
+        transition: opacity 0.18s ease;
+      }
+
+      .tm-md-pass{
+        position: relative;
+        background: rgba(30, 143, 77, 0.06);
+        box-shadow: inset 0 0 0 2px rgba(30, 143, 77, 0.40);
+      }
+
+      .tm-md-fail{
+        position: relative;
+        background: rgba(214, 69, 69, 0.06);
+        box-shadow: inset 0 0 0 2px rgba(214, 69, 69, 0.40);
+      }
+
+      .tm-md-unknown{
+        position: relative;
+        filter: saturate(0.95);
+        background: rgba(255, 214, 64, 0.08);
+        box-shadow: inset 0 0 0 2px rgba(255, 214, 64, 0.38);
+      }
+
+      .tm-md-loading-card{
+        position: relative;
+        filter: grayscale(1);
+        opacity: 0.55;
+      }
+
+      .tm-md-loading-overlay{
+        position: absolute;
+        inset: 0;
+        z-index: 10002;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(255,255,255,0.14);
+        backdrop-filter: blur(1px);
+        pointer-events: none;
+      }
+
+      .tm-md-loading-overlay .tm-md-spinner-svg{
+        width: 34px;
+        height: 34px;
+      }
+
+      .tm-md-loading-overlay .tm-md-spinner-svg circle{
+        stroke: rgba(0,0,0,0.72);
+      }
+
+      .tm-md-hidden{
+        display: none !important;
+      }
+
+      .tm-md-unknown-label{
+        position: absolute;
+        left: 8px;
+        right: 8px;
+        bottom: 8px;
+        z-index: 10001;
+        background: rgba(255, 214, 64, 0.96);
+        color: #2f2400;
+        border-radius: 10px;
+        padding: 6px 8px;
+        font-size: 11px;
+        font-weight: 700;
+        text-align: center;
+        line-height: 1.2;
+        box-shadow: 0 6px 16px rgba(0,0,0,0.15);
       }
 
       #tm-md-tooltip{
         position: fixed; z-index: 1000000; display: none;
-        padding: 10px 12px; border-radius: 12px;
-        background: rgba(20,20,20,0.92); color: white;
-        box-shadow: 0 10px 28px rgba(0,0,0,0.28);
-        max-width: 340px;
+        min-width: 260px;
+        max-width: 360px;
+        padding: 12px;
+        border-radius: 16px;
+        background: rgba(16,18,22,0.96);
+        color: white;
+        box-shadow: 0 14px 34px rgba(0,0,0,0.34);
         font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
         font-size: 13px; line-height: 1.25;
         pointer-events: none;
+        backdrop-filter: blur(8px);
       }
-      .tm-md-tip-title{ opacity: 0.92; margin-bottom: 6px; }
-      .tm-md-tip-line{ margin: 3px 0; }
-      .tm-md-tip-footer{ opacity: 0.75; margin-top: 8px; font-size: 12px; }
-      .tm-md-tip-warn{ opacity: 0.9; margin-top: 6px; font-size: 12px; }
+
+      .tm-md-tip-title{
+        opacity: 0.97;
+        margin-bottom: 10px;
+        font-size: 14px;
+        font-weight: 700;
+        line-height: 1.3;
+      }
+
+      .tm-md-tip-list{
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .tm-md-tip-card{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 10px;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.06);
+      }
+
+      .tm-md-tip-card-icon{
+        width: 26px;
+        height: 26px;
+        min-width: 26px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.1);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .tm-md-tip-card-icon svg{
+        width: 15px;
+        height: 15px;
+        fill: white;
+        opacity: 0.95;
+      }
+
+      .tm-md-tip-card-body{
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+
+      .tm-md-tip-card-label{
+        font-size: 11px;
+        opacity: 0.72;
+        text-transform: uppercase;
+        letter-spacing: .04em;
+      }
+
+      .tm-md-tip-card-value{
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1.2;
+      }
+
+      .tm-md-tip-footer{
+        opacity: 0.72;
+        margin-top: 10px;
+        font-size: 12px;
+      }
+
+      .tm-md-tip-warn{
+        opacity: 0.95;
+        margin-top: 10px;
+        font-size: 12px;
+        color: #ffd28c;
+      }
+
+      .tm-md-empty{
+        padding: 8px 10px;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.06);
+      }
+
+      .tm-md-loading{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 10px;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.06);
+      }
+
+      .tm-md-spinner{
+        width: 22px;
+        height: 22px;
+        min-width: 22px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .tm-md-spinner-svg{
+        width: 22px;
+        height: 22px;
+        animation: tm-md-spin 0.9s linear infinite;
+      }
+
+      .tm-md-spinner-svg circle{
+        stroke: white;
+        opacity: 0.9;
+        stroke-dasharray: 90;
+        stroke-dashoffset: 50;
+      }
+
+      .tm-md-nutri{
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        flex-wrap: nowrap;
+      }
+
+      .tm-md-nutri-seg{
+        width: 20px;
+        height: 18px;
+        border-radius: 5px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 10px;
+        font-weight: 800;
+        color: rgba(255,255,255,0.75);
+        background: rgba(255,255,255,0.16);
+        border: 1px solid rgba(255,255,255,0.08);
+      }
+
+      .tm-md-nutri-seg.active{
+        width: 26px;
+        height: 22px;
+        color: white;
+        box-shadow: 0 0 0 2px rgba(255,255,255,0.15);
+        transform: scale(1.05);
+      }
+
+      .tm-md-nutri-unknown{
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      @keyframes tm-md-spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
     `;
     document.head.appendChild(style);
   },
 
-  /** Crea tooltip si no existe */
   ensureTooltip() {
     if (document.getElementById("tm-md-tooltip")) return;
     const t = document.createElement("div");
@@ -481,7 +963,6 @@ const UI = {
     document.body.appendChild(t);
   },
 
-  /** Muestra tooltip en coordenadas */
   showTooltip(x, y, html) {
     const t = document.getElementById("tm-md-tooltip");
     if (!t) return;
@@ -489,35 +970,74 @@ const UI = {
     t.innerHTML = html;
     t.style.display = "block";
 
-    const offsetX = 14,
-      offsetY = 14;
-    const maxX = window.innerWidth - 360;
-    const maxY = window.innerHeight - 180;
+    const offsetX = 14;
+    const offsetY = 14;
+    const maxX = window.innerWidth - 380;
+    const maxY = window.innerHeight - 260;
 
     t.style.left = Math.min(x + offsetX, maxX) + "px";
     t.style.top = Math.min(y + offsetY, maxY) + "px";
   },
 
-  /** Oculta tooltip */
   hideTooltip() {
     const t = document.getElementById("tm-md-tooltip");
     if (t) t.style.display = "none";
   },
 
-  /** Construye tooltip con líneas (solo lo marcado) */
-  tooltipHtml({ title, lines, footer, warn }) {
-    const safeTitle = Utils.escapeHtml(title);
+  loadingTooltipHtml(title, message = "Cargando información…") {
+    return `
+      <div class="tm-md-tip-title">${Utils.escapeHtml(title)}</div>
+      <div class="tm-md-loading">
+        <span class="tm-md-spinner">${Icons.spinner}</span>
+        <div>${Utils.escapeHtml(message)}</div>
+      </div>
+    `;
+  },
 
-    const linesHtml = (lines || [])
-      .map((l) => `<div class="tm-md-tip-line">${Utils.escapeHtml(l)}</div>`)
+  nutriVisualHtml(grade) {
+    const g = String(grade || "").toLowerCase();
+    if (!["a", "b", "c", "d", "e"].includes(g)) {
+      return `<span class="tm-md-nutri-unknown">No disponible</span>`;
+    }
+
+    const letters = ["a", "b", "c", "d", "e"];
+    const segs = letters
+      .map((letter) => {
+        const active = letter === g ? "active" : "";
+        const bg = Utils.nutriColor(letter);
+        return `<span class="tm-md-nutri-seg ${active}" style="background:${bg}">${letter.toUpperCase()}</span>`;
+      })
       .join("");
 
+    return `<span class="tm-md-nutri">${segs}</span>`;
+  },
+
+  infoCardHtml({ icon, label, valueHtml }) {
+    return `
+      <div class="tm-md-tip-card">
+        <div class="tm-md-tip-card-icon">${icon}</div>
+        <div class="tm-md-tip-card-body">
+          <div class="tm-md-tip-card-label">${Utils.escapeHtml(label)}</div>
+          <div class="tm-md-tip-card-value">${valueHtml}</div>
+        </div>
+      </div>
+    `;
+  },
+
+  tooltipHtml({ title, cardsHtml, footer, warn }) {
+    const safeTitle = Utils.escapeHtml(title);
     const footerHtml = footer ? `<div class="tm-md-tip-footer">${Utils.escapeHtml(footer)}</div>` : "";
     const warnHtml = warn ? `<div class="tm-md-tip-warn">${Utils.escapeHtml(warn)}</div>` : "";
+    const emptyHtml =
+      !cardsHtml && !warn
+        ? `<div class="tm-md-empty">No has seleccionado campos en el menú.</div>`
+        : "";
 
     return `
       <div class="tm-md-tip-title">${safeTitle}</div>
-      ${linesHtml || `<div class="tm-md-tip-line">No has seleccionado campos en el menú.</div>`}
+      <div class="tm-md-tip-list">
+        ${cardsHtml || emptyHtml}
+      </div>
       ${warnHtml}
       ${footerHtml}
     `;
@@ -528,7 +1048,6 @@ const UI = {
 /*          DOM/LOGIC      */
 /* <---------------------> */
 const Dom = {
-  /** Devuelve tarjetas de producto “válidas” */
   findProductCards() {
     const set = new Set();
     for (const sel of Config.SELECTORS.productCards) {
@@ -545,7 +1064,6 @@ const Dom = {
     return out;
   },
 
-  /** Extrae nombre del producto */
   getName(card) {
     for (const sel of Config.SELECTORS.name) {
       const el = card.querySelector(sel);
@@ -557,14 +1075,12 @@ const Dom = {
     return "Producto";
   },
 
-  /** Intenta inferir marca desde aria-label (si existe) */
   getBrandHint(card) {
     const aria = card.querySelector(Config.SELECTORS.openDetailBtn)?.getAttribute("aria-label") || "";
     const m = aria.match(/^(Hacendado|Deliplus|Bosque Verde|Compy|Mercadona)\b/i);
     return m ? m[1] : "";
   },
 
-  /** Resuelve id: índice por nombre+marca o desde la URL de detalle */
   resolveProductId(card) {
     const name = Dom.getName(card);
     const brand = Dom.getBrandHint(card);
@@ -580,10 +1096,136 @@ const Dom = {
 };
 
 /* <---------------------> */
+/*          FILTERS        */
+/* <---------------------> */
+const Filters = {
+  ensureUnknownLabel(card) {
+    let label = card.querySelector(":scope > .tm-md-unknown-label");
+    if (!label) {
+      label = document.createElement("div");
+      label.className = "tm-md-unknown-label";
+      card.appendChild(label);
+    }
+    label.textContent = "Nistriscore No Disponible";
+  },
+
+  ensureLoadingOverlay(card) {
+    let overlay = card.querySelector(":scope > .tm-md-loading-overlay");
+    if (!overlay) {
+      overlay = document.createElement("div");
+      overlay.className = "tm-md-loading-overlay";
+      overlay.innerHTML = Icons.spinner;
+      card.appendChild(overlay);
+    }
+  },
+
+  removeLoadingOverlay(card) {
+    const overlay = card.querySelector(":scope > .tm-md-loading-overlay");
+    if (overlay) overlay.remove();
+  },
+
+  clearCard(card) {
+    card.classList.remove(
+      "tm-md-muted",
+      "tm-md-hidden",
+      "tm-md-unknown",
+      "tm-md-pass",
+      "tm-md-fail",
+      "tm-md-loading-card"
+    );
+    const label = card.querySelector(":scope > .tm-md-unknown-label");
+    if (label) label.remove();
+    Filters.removeLoadingOverlay(card);
+  },
+
+  markLoading(card) {
+    Filters.clearCard(card);
+    card.classList.add("tm-md-loading-card");
+    Filters.ensureLoadingOverlay(card);
+  },
+
+  schedule(card) {
+    if (!card || State.filterQueueSet.has(card)) return;
+    State.filterQueue.push(card);
+    State.filterQueueSet.add(card);
+    Filters.runWorkers();
+  },
+
+  runWorkers() {
+    while (State.filterWorkerActive < Config.FILTER_CONCURRENCY && State.filterQueue.length > 0) {
+      const card = State.filterQueue.shift();
+      State.filterQueueSet.delete(card);
+      State.filterWorkerActive++;
+      Filters.evaluateCard(card)
+        .catch(() => {})
+        .finally(() => {
+          State.filterWorkerActive--;
+          Filters.runWorkers();
+        });
+    }
+  },
+
+  async evaluateCard(card) {
+    if (!card || !document.body.contains(card)) return;
+
+    const filterOptions = Utils.getFilterOptions();
+
+    if (filterOptions.threshold === "none") {
+      Filters.clearCard(card);
+      return;
+    }
+
+    const id = Dom.resolveProductId(card);
+    if (!id) {
+      Filters.markLoading(card);
+      return;
+    }
+
+    Filters.markLoading(card);
+
+    const ean = await API.getEanById(id);
+    if (!ean) {
+      Filters.markLoading(card);
+      return;
+    }
+
+    const off = await API.getOffDataByEan(ean);
+    const realGrade = String(off.nutriscoreGrade || "").toLowerCase();
+
+    Filters.clearCard(card);
+
+    if (!["a", "b", "c", "d", "e"].includes(realGrade)) {
+      card.classList.add("tm-md-unknown");
+      Filters.ensureUnknownLabel(card);
+      return;
+    }
+
+    const pass = Utils.passesNutriThreshold(realGrade, filterOptions.threshold);
+
+    if (pass) {
+      card.classList.add("tm-md-pass");
+      return;
+    }
+
+    if (filterOptions.mode === "hide") {
+      card.classList.add("tm-md-hidden");
+    } else {
+      card.classList.add("tm-md-fail");
+    }
+  },
+
+  reapplyAll() {
+    const cards = Dom.findProductCards();
+    for (const card of cards) {
+      Filters.schedule(card);
+    }
+  },
+};
+
+/* <---------------------> */
 /*           BADGES        */
 /* <---------------------> */
 const Badges = {
-  /** Arranca repintado y observer SPA */
   init() {
     Badges.repaint();
 
@@ -595,13 +1237,14 @@ const Badges = {
     obs.observe(document.body, { childList: true, subtree: true });
   },
 
-  /** Asegura un badge por tarjeta */
   repaint() {
     const cards = Dom.findProductCards();
-    for (const card of cards) Badges.ensureBadge(card);
+    for (const card of cards) {
+      Badges.ensureBadge(card);
+      Filters.schedule(card);
+    }
   },
 
-  /** Inserta badge si no existe y engancha hover */
   ensureBadge(card) {
     const cs = window.getComputedStyle(card);
     if (cs.position === "static") card.style.position = "relative";
@@ -610,30 +1253,82 @@ const Badges = {
     if (!badge) {
       badge = document.createElement("div");
       badge.className = "tm-md-badge";
-
-      // Icono "info" neutral (SVG embebido, sin librerías)
-      badge.innerHTML = `
-        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10
-                   10-4.48 10-10S17.52 2 12 2zm0 4a1.25 1.25 0 110 2.5A1.25 1.25 0 0112 6zm1.5 12h-3v-1.5h1.5V11h-1.5V9.5h3V16.5h1.5V18z"/>
-        </svg>
-      `;
-
+      badge.innerHTML = Icons.info;
       card.prepend(badge);
       Badges.attachHover(badge, card);
     }
   },
 
-  /** Define el comportamiento hover (según checkboxes) */
+  buildCardsHtml(off, infoOptions) {
+    const cards = [];
+
+    if (infoOptions.nutriscore) {
+      const realGrade = String(off.nutriscoreGrade || "").toLowerCase();
+      cards.push(
+        UI.infoCardHtml({
+          icon: Icons.info,
+          label: "Nutri-Score",
+          valueHtml: UI.nutriVisualHtml(realGrade),
+        })
+      );
+    }
+
+    if (infoOptions.nova) {
+      cards.push(
+        UI.infoCardHtml({
+          icon: Icons.nova,
+          label: "NOVA",
+          valueHtml: Utils.escapeHtml(Utils.normalizeDisplayValue(Utils.formatNovaGroup(off.novaGroup))),
+        })
+      );
+    }
+
+    if (infoOptions.additives) {
+      cards.push(
+        UI.infoCardHtml({
+          icon: Icons.additives,
+          label: "Aditivos",
+          valueHtml: Utils.escapeHtml(Utils.normalizeDisplayValue(Utils.formatAdditivesCount(off.additivesN))),
+        })
+      );
+    }
+
+    if (infoOptions.added_sugars) {
+      cards.push(
+        UI.infoCardHtml({
+          icon: Icons.sugar,
+          label: "Azúcares añadidos",
+          valueHtml: Utils.escapeHtml(Utils.normalizeDisplayValue(Utils.formatAddedSugars(off.addedSugarsText))),
+        })
+      );
+    }
+
+    if (infoOptions.salt_level) {
+      cards.push(
+        UI.infoCardHtml({
+          icon: Icons.salt,
+          label: "Nivel de sal",
+          valueHtml: Utils.escapeHtml(Utils.normalizeDisplayValue(Utils.formatSaltLevel(off.saltLevelText))),
+        })
+      );
+    }
+
+    return cards.join("");
+  },
+
   attachHover(badge, card) {
-    // Cierre robusto (evita tooltip “pegado”)
     const stopTracking = () => {
       UI.hideTooltip();
+
       if (badge._tmOnMove) document.removeEventListener("mousemove", badge._tmOnMove);
+      if (badge._tmOnScroll) window.removeEventListener("scroll", badge._tmOnScroll, true);
+      if (badge._tmOnVis) document.removeEventListener("visibilitychange", badge._tmOnVis);
+
       badge._tmOnMove = null;
+      badge._tmOnScroll = null;
+      badge._tmOnVis = null;
     };
 
-    // Mantiene tooltip pegado al cursor SOLO si seguimos hover sobre el badge
     const onMove = (ev) => {
       if (!badge.matches(":hover")) {
         stopTracking();
@@ -643,28 +1338,18 @@ const Badges = {
       if (t && t.style.display === "block") UI.showTooltip(ev.clientX, ev.clientY, t.innerHTML);
     };
 
-    // Cierra también en scroll / cambio de pestaña (SPA)
     const onScroll = () => stopTracking();
     const onVis = () => {
       if (document.hidden) stopTracking();
     };
 
     badge.addEventListener("mouseenter", async (ev) => {
-      // Nos aseguramos de limpiar cualquier estado previo
       stopTracking();
 
       const name = Dom.getName(card);
-      const options = Utils.getSelectedOptions();
+      const infoOptions = Utils.getSelectedInfoOptions();
 
-      UI.showTooltip(
-        ev.clientX,
-        ev.clientY,
-        UI.tooltipHtml({
-          title: name,
-          lines: ["Cargando…"],
-          footer: "",
-        })
-      );
+      UI.showTooltip(ev.clientX, ev.clientY, UI.loadingTooltipHtml(name, "Cargando información…"));
 
       const id = Dom.resolveProductId(card);
       if (!id) {
@@ -673,16 +1358,17 @@ const Badges = {
           ev.clientY,
           UI.tooltipHtml({
             title: name,
-            lines: [],
-            warn: "Aún no tengo el ID de este producto (prueba a hacer scroll o cambiar de categoría).",
+            cardsHtml: "",
+            warn: "No disponible",
             footer: "",
           })
         );
-        document.addEventListener("mousemove", onMove);
-        badge._tmOnMove = onMove;
 
+        document.addEventListener("mousemove", onMove);
         window.addEventListener("scroll", onScroll, true);
         document.addEventListener("visibilitychange", onVis);
+
+        badge._tmOnMove = onMove;
         badge._tmOnScroll = onScroll;
         badge._tmOnVis = onVis;
         return;
@@ -696,48 +1382,25 @@ const Badges = {
             ev.clientY,
             UI.tooltipHtml({
               title: name,
-              lines: [],
-              warn: "No se pudo obtener el EAN.",
+              cardsHtml: "",
+              warn: "No disponible",
               footer: `ID: ${id}`,
             })
           );
-          document.addEventListener("mousemove", onMove);
-          badge._tmOnMove = onMove;
 
+          document.addEventListener("mousemove", onMove);
           window.addEventListener("scroll", onScroll, true);
           document.addEventListener("visibilitychange", onVis);
+
+          badge._tmOnMove = onMove;
           badge._tmOnScroll = onScroll;
           badge._tmOnVis = onVis;
           return;
         }
 
         const off = await API.getOffDataByEan(ean);
+        const cardsHtml = Badges.buildCardsHtml(off, infoOptions);
 
-        // Construimos líneas SOLO con lo marcado
-        const lines = [];
-
-        if (options.nutriscore) {
-          const grade = off.nutriscoreGrade ? off.nutriscoreGrade.toUpperCase() : "No disponible";
-          lines.push(`Nutri-Score: ${grade}`);
-        }
-
-        if (options.nova) {
-          lines.push(`NOVA: ${off.novaGroup != null ? off.novaGroup : "No disponible"}`);
-        }
-
-        if (options.additives) {
-          lines.push(`Aditivos: ${off.additivesN != null ? off.additivesN : "No disponible"}`);
-        }
-
-        if (options.added_sugars) {
-          lines.push(`Azúcares añadidos: ${off.addedSugarsText || "No disponible"}`);
-        }
-
-        if (options.salt_level) {
-          lines.push(`Nivel de sal: ${off.saltLevelText || "No disponible"}`);
-        }
-
-        // Aviso si OFF tiene baja “completitud”
         let warn = "";
         if (off.completeness != null && off.completeness < 0.4) {
           warn = "Datos incompletos en Open Food Facts (puede faltar información).";
@@ -748,7 +1411,7 @@ const Badges = {
           ev.clientY,
           UI.tooltipHtml({
             title: name,
-            lines,
+            cardsHtml,
             warn,
             footer: `EAN: ${ean}`,
           })
@@ -759,30 +1422,23 @@ const Badges = {
           ev.clientY,
           UI.tooltipHtml({
             title: name,
-            lines: [],
-            warn: "Error consultando datos (puede ser temporal).",
+            cardsHtml: "",
+            warn: "No disponible",
             footer: "",
           })
         );
       }
 
-      // Tracking robusto para evitar tooltip “pegado”
       document.addEventListener("mousemove", onMove);
-      badge._tmOnMove = onMove;
-
       window.addEventListener("scroll", onScroll, true);
       document.addEventListener("visibilitychange", onVis);
+
+      badge._tmOnMove = onMove;
       badge._tmOnScroll = onScroll;
       badge._tmOnVis = onVis;
     });
 
-    badge.addEventListener("mouseleave", () => {
-      stopTracking();
-      if (badge._tmOnScroll) window.removeEventListener("scroll", badge._tmOnScroll, true);
-      if (badge._tmOnVis) document.removeEventListener("visibilitychange", badge._tmOnVis);
-      badge._tmOnScroll = null;
-      badge._tmOnVis = null;
-    });
+    badge.addEventListener("mouseleave", stopTracking);
   },
 };
 
@@ -790,7 +1446,6 @@ const Badges = {
 /*            MAIN         */
 /* <---------------------> */
 const Main = {
-  /** Punto de entrada: engancha fetch y arranca UI/Badges al cargar DOM */
   init() {
     Indexer.hookFetch();
 
