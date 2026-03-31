@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Mercadona - Info nutricional visual + filtros por Nutri-Score
 // @namespace    http://tampermonkey.net/
-// @version      1.7.1
+// @version      1.8.0
 // @description  Icono de información por producto. Tooltip visual con Nutri-Score, NOVA, aditivos, azúcares añadidos y nivel de sal. Filtro visual por Nutri-Score con estados de carga.
 // @match        https://tienda.mercadona.es/*
 // @run-at       document-start
@@ -39,9 +39,26 @@ const Config = {
     { key: "nutriscore", label: "Nutri-Score" },
     { key: "nova", label: "NOVA (procesado)" },
     { key: "additives", label: "Aditivos" },
+    { key: "gluten", label: "Gluten" },
     { key: "added_sugars", label: "Azúcares añadidos" },
     { key: "salt_level", label: "Nivel de sal" },
   ],
+
+  INFO_HELP: {
+    nutriscore: "Resume la calidad nutricional general del alimento con una escala de A a E.",
+    nova: "Indica el grado de procesamiento industrial del alimento segun la clasificacion NOVA.",
+    additives: "Muestra cuantos aditivos detecta Open Food Facts para ese producto.",
+    gluten: "Se basa en alergenos, trazas y etiquetas de OFF para indicar si contiene gluten o no.",
+    added_sugars: "Intenta detectar si el producto tiene azucares añadidos usando datos y etiquetas de OFF.",
+    salt_level: "Clasifica la sal por cada 100 g o 100 ml en bajo, medio o alto.",
+  },
+
+  FILTER_HELP: {
+    threshold: "Define el Nutri-Score minimo que aceptas para mostrar el producto como valido.",
+    mode: "Decide si los productos que no cumplen se ocultan o solo se remarcan en rojo.",
+    hideUnknown: "Oculta productos sin Nutri-Score disponible en Open Food Facts.",
+    hideGluten: "Oculta productos que OFF marca como contienen gluten.",
+  },
 
   FILTER_THRESHOLDS: [
     { value: "none", label: "Sin filtro" },
@@ -138,8 +155,11 @@ const Utils = {
       const raw = localStorage.getItem(Config.STORAGE.infoOptionsKey);
       if (!raw) return Utils.defaultInfoOptions();
       const obj = JSON.parse(raw);
+      const defaults = Utils.defaultInfoOptions();
       const out = {};
-      for (const opt of Config.INFO_OPTIONS) out[opt.key] = !!obj[opt.key];
+      for (const opt of Config.INFO_OPTIONS) {
+        out[opt.key] = opt.key in obj ? !!obj[opt.key] : !!defaults[opt.key];
+      }
       return out;
     } catch {
       return Utils.defaultInfoOptions();
@@ -155,6 +175,7 @@ const Utils = {
       nutriscore: true,
       nova: true,
       additives: true,
+      gluten: true,
       added_sugars: true,
       salt_level: true,
     };
@@ -169,6 +190,7 @@ const Utils = {
         threshold: obj?.threshold || "none",
         mode: obj?.mode || "mark",
         hideUnknown: !!obj?.hideUnknown,
+        hideGluten: !!obj?.hideGluten,
       };
     } catch {
       return Utils.defaultFilterOptions();
@@ -184,7 +206,36 @@ const Utils = {
       threshold: "none",
       mode: "mark",
       hideUnknown: false,
+      hideGluten: false,
     };
+  },
+
+  toStringArray(value) {
+    if (Array.isArray(value)) return value.map((item) => String(item || "").trim()).filter(Boolean);
+    if (value == null) return [];
+    const single = String(value).trim();
+    return single ? [single] : [];
+  },
+
+  hasAnyExactTag(values, expectedTags) {
+    const set = new Set(Utils.toStringArray(values).map((item) => item.toLowerCase()));
+    for (const tag of expectedTags) {
+      if (set.has(String(tag).toLowerCase())) return true;
+    }
+    return false;
+  },
+
+  hasAnyTagFragment(values, fragments) {
+    const haystack = Utils.toStringArray(values).map((item) => item.toLowerCase());
+    return fragments.some((fragment) =>
+      haystack.some((item) => item.includes(String(fragment).toLowerCase()))
+    );
+  },
+
+  textContainsAny(text, fragments) {
+    const normalized = String(text || "").toLowerCase();
+    if (!normalized) return false;
+    return fragments.some((fragment) => normalized.includes(String(fragment).toLowerCase()));
   },
 
   saltLevelFromValue(salt100g) {
@@ -214,6 +265,151 @@ const Utils = {
     return "No disponible";
   },
 
+  addedSugarsFromProduct(product) {
+    const analysisTags = Utils.toStringArray(product?.ingredients_analysis_tags || product?.ingredients_analysis);
+    const labelsTags = Utils.toStringArray(product?.labels_tags || product?.labels_hierarchy);
+    const ingredientTags = Utils.toStringArray(product?.ingredients_tags);
+    const ingredientText = [
+      product?.ingredients_text,
+      product?.ingredients_text_es,
+      product?.ingredients_text_en,
+    ]
+      .filter(Boolean)
+      .join(" | ");
+
+    if (
+      Utils.hasAnyExactTag(analysisTags, ["en:no-added-sugars", "en:unsweetened"]) ||
+      Utils.hasAnyExactTag(labelsTags, [
+        "en:no-added-sugar",
+        "en:no-added-sugars",
+        "en:without-added-sugars",
+        "en:unsweetened",
+      ])
+    ) {
+      return "Sin az\u00facares a\u00f1adidos";
+    }
+
+    if (
+      Utils.hasAnyExactTag(analysisTags, [
+        "en:added-sugars",
+        "en:has-added-sugars",
+        "en:with-added-sugars",
+        "en:sweetened",
+      ]) ||
+      Utils.hasAnyTagFragment(labelsTags, ["added-sugar", "added-sugars", "sweetened"])
+    ) {
+      return "Con az\u00facares a\u00f1adidos";
+    }
+
+    const addedSugarFragments = [
+      "azucar",
+      "az\u00facar",
+      "sucre",
+      "sugar",
+      "glucose",
+      "glucose-fructose",
+      "glucose syrup",
+      "jarabe de glucosa",
+      "jarabe de glucosa-fructosa",
+      "fructose",
+      "fructosa",
+      "dextrose",
+      "dextrosa",
+      "maltose",
+      "maltosa",
+      "maltodextrin",
+      "maltodextrina",
+      "honey",
+      "miel",
+      "caramel",
+      "caramelo",
+      "molasses",
+      "melaza",
+      "sucrose",
+      "sacarosa",
+      "agave",
+      "sirope",
+      "syrup",
+    ];
+
+    if (
+      Utils.hasAnyTagFragment(ingredientTags, addedSugarFragments) ||
+      Utils.textContainsAny(ingredientText, addedSugarFragments)
+    ) {
+      return "Probablemente con az\u00facares a\u00f1adidos";
+    }
+
+    return "No disponible";
+  },
+
+  glutenInfoFromProduct(product) {
+    const allergenTags = Utils.toStringArray(product?.allergens_tags || product?.allergens_hierarchy);
+    const traceTags = Utils.toStringArray(product?.traces_tags || product?.traces_hierarchy);
+    const labelsTags = Utils.toStringArray(product?.labels_tags || product?.labels_hierarchy);
+    const declaredAllergens = [
+      product?.allergens,
+      product?.allergens_from_ingredients,
+      product?.allergens_from_user,
+    ]
+      .filter(Boolean)
+      .join(" | ");
+
+    const hasGlutenAllergen =
+      Utils.hasAnyTagFragment(allergenTags, ["gluten"]) ||
+      Utils.textContainsAny(declaredAllergens, ["gluten"]);
+    const hasGlutenTrace =
+      Utils.hasAnyTagFragment(traceTags, ["gluten"]) ||
+      Utils.textContainsAny(product?.traces, ["gluten"]);
+    const isGlutenFree = Utils.hasAnyExactTag(labelsTags, ["en:gluten-free", "en:no-gluten"]);
+    const isVeryLowGluten = Utils.hasAnyExactTag(labelsTags, ["en:very-low-gluten"]);
+
+    if (hasGlutenAllergen && isGlutenFree) {
+      return {
+        status: "Revisar OFF",
+        detail: "Datos contradictorios entre alergenos y etiqueta",
+        tone: "warning",
+      };
+    }
+
+    if (hasGlutenAllergen) {
+      return {
+        status: "Contiene gluten",
+        detail: "Alergeno declarado en Open Food Facts",
+        tone: "danger",
+      };
+    }
+
+    if (hasGlutenTrace) {
+      return {
+        status: "Puede contener gluten",
+        detail: "Trazas declaradas en Open Food Facts",
+        tone: "warning",
+      };
+    }
+
+    if (isGlutenFree) {
+      return {
+        status: "Sin gluten",
+        detail: "Etiqueta sin gluten en Open Food Facts",
+        tone: "safe",
+      };
+    }
+
+    if (isVeryLowGluten) {
+      return {
+        status: "Muy bajo en gluten",
+        detail: "Etiqueta especifica en Open Food Facts",
+        tone: "warning",
+      };
+    }
+
+    return {
+      status: "No disponible",
+      detail: "OFF no aporta un campo claro para este producto",
+      tone: "unknown",
+    };
+  },
+
   nutriValue(grade) {
     const map = { a: 1, b: 2, c: 3, d: 4, e: 5 };
     return map[String(grade || "").toLowerCase()] || null;
@@ -239,6 +435,11 @@ const Utils = {
 
   formatAddedSugars(text) {
     const normalized = Utils.normalizeDisplayValue(text);
+    if (normalized === "Sin az\u00facares a\u00f1adidos") return "Sin a\u00f1adidos";
+    if (normalized === "Con az\u00facares a\u00f1adidos") return "Con a\u00f1adidos";
+    if (normalized === "Probablemente con az\u00facares a\u00f1adidos") {
+      return "Probablemente con a\u00f1adidos";
+    }
     if (normalized === "Sin azúcares añadidos") return "Sin añadidos";
     if (normalized === "Con azúcares añadidos") return "Con añadidos";
     return "No disponible";
@@ -383,6 +584,7 @@ const API = {
           novaGroup: null,
           additivesN: null,
           addedSugarsText: "No disponible",
+          glutenInfo: Utils.glutenInfoFromProduct(null),
           salt100g: null,
           saltLevelText: "No disponible",
           completeness: null,
@@ -406,8 +608,8 @@ const API = {
           ? product.additives_tags.length
           : null;
 
-      const tags = product?.ingredients_analysis_tags || product?.ingredients_analysis || [];
-      const addedSugarsText = Utils.normalizeDisplayValue(Utils.addedSugarsFromTags(tags));
+      const addedSugarsText = Utils.normalizeDisplayValue(Utils.addedSugarsFromProduct(product));
+      const glutenInfo = Utils.glutenInfoFromProduct(product);
 
       const saltRaw =
         product?.nutriments?.salt_100g != null ? product.nutriments.salt_100g : null;
@@ -421,6 +623,7 @@ const API = {
         novaGroup,
         additivesN,
         addedSugarsText,
+        glutenInfo,
         salt100g,
         saltLevelText: Utils.normalizeDisplayValue(saltLevel.text),
         completeness,
@@ -443,10 +646,32 @@ const API = {
 /*         ICONS           */
 /* <---------------------> */
 const Icons = {
+  menu: `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M5 3.5A2.5 2.5 0 107.5 6 2.5 2.5 0 005 3.5zm11 1a4 4 0 013.98 3.59L20 8.5V10h-1.5V8.5a2.5 2.5 0 00-4.99-.16L13.5 8.5v7.55a3.5 3.5 0 11-3 0V8.5a2.5 2.5 0 10-5 0V10H4V8.5a4 4 0 017.98-.41L12 8.5v7.55a3.5 3.5 0 11-3 0V8.5a1 1 0 00-2 0V10H5.5V8.5a2.5 2.5 0 015 0v7.55a1.5 1.5 0 103 0V8.5a4 4 0 014-4z"/>
+      <path d="M18 3a3 3 0 110 6 3 3 0 010-6zm0 1.4a1.6 1.6 0 100 3.2 1.6 1.6 0 000-3.2z"/>
+      <path d="M18.65 11.7h-1.3v-.94h1.3v.94zm0 5.54h-1.3v-4.62h1.3v4.62z"/>
+    </svg>
+  `,
   info: `
     <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
       <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10
                10-4.48 10-10S17.52 2 12 2zm0 4a1.25 1.25 0 110 2.5A1.25 1.25 0 0112 6zm1.5 12h-3v-1.5h1.5V11h-1.5V9.5h3V16.5h1.5V18z"/>
+    </svg>
+  `,
+  help: `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M12 2.75A9.25 9.25 0 1112 21.25 9.25 9.25 0 0112 2.75zm0 1.5a7.75 7.75 0 100 15.5 7.75 7.75 0 000-15.5zm0 11.15a1.05 1.05 0 110 2.1 1.05 1.05 0 010-2.1zm.14-8.6c1.95 0 3.3 1.08 3.3 2.8 0 1.18-.63 1.92-1.7 2.59-.9.56-1.16.9-1.16 1.56v.25h-1.56v-.37c0-1.16.46-1.82 1.57-2.5.86-.53 1.27-.94 1.27-1.57 0-.76-.62-1.27-1.65-1.27-1 0-1.73.48-2.47 1.37l-1.12-.94c.9-1.25 2.1-1.92 3.52-1.92z"/>
+    </svg>
+  `,
+  chevronDown: `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M6.7 9.3a1 1 0 011.4 0L12 13.17l3.9-3.88a1 1 0 111.4 1.42l-4.6 4.57a1 1 0 01-1.4 0L6.7 10.7a1 1 0 010-1.4z"/>
+    </svg>
+  `,
+  chevronUp: `
+    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M17.3 14.7a1 1 0 01-1.4 0L12 10.83 8.1 14.7a1 1 0 11-1.4-1.42l4.6-4.57a1 1 0 011.4 0l4.6 4.57a1 1 0 010 1.4z"/>
     </svg>
   `,
   nova: `
@@ -457,6 +682,11 @@ const Icons = {
   additives: `
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M7 3h10v2h-1v4.17l2.59 2.58A2 2 0 0119 13.17V19a2 2 0 01-2 2H7a2 2 0 01-2-2v-5.83a2 2 0 01.41-1.22L8 9.17V5H7V3zm3 2v4.83L7.41 12.4A.5.5 0 007.3 12.7V19a.5.5 0 00.5.5h8.4a.5.5 0 00.5-.5v-6.3a.5.5 0 00-.11-.3L14 9.83V5h-4z"/>
+    </svg>
+  `,
+  gluten: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 2c2.4 0 4 2.2 4 4.9 0 1.9-.8 3.2-1.8 4.6-.8 1.1-1.7 2.3-2.2 4V22h-2v-6.5c-.5-1.7-1.3-2.9-2.1-4C6.8 10.1 6 8.8 6 6.9 6 4.2 7.6 2 10 2c.8 0 1.5.2 2 .7.5-.5 1.2-.7 2-.7zm-2 2c-1.2 0-2 1.3-2 2.9 0 1.2.5 2.1 1.3 3.2.2.3.5.7.7 1 .2-.3.5-.7.7-1 .8-1.1 1.3-2 1.3-3.2C12 5.3 11.2 4 10 4zm4 0c-1.2 0-2 1.3-2 2.9 0 1.2.5 2.1 1.3 3.2.2.3.5.7.7 1 .2-.3.5-.7.7-1 .8-1.1 1.3-2 1.3-3.2C16 5.3 15.2 4 14 4z"/>
     </svg>
   `,
   sugar: `
@@ -487,6 +717,74 @@ const UI = {
     UI.injectMenu();
     UI.injectStyles();
     UI.ensureTooltip();
+    UI.ensureMenuHelpTooltip();
+  },
+
+  setMenuButtonState(btn, open) {
+    btn.innerHTML = `
+      <span class="tm-md-btn-main">
+        <span class="tm-md-btn-icon">${Icons.menu}</span>
+        <span class="tm-md-btn-text">Info nutricional</span>
+      </span>
+      <span class="tm-md-btn-chevron">${open ? Icons.chevronUp : Icons.chevronDown}</span>
+    `;
+  },
+
+  createHelpIcon(text) {
+    const help = document.createElement("span");
+    help.className = "tm-md-help";
+    help.innerHTML = Icons.help;
+    help.tabIndex = 0;
+
+    const show = (ev) => UI.showMenuHelpTooltip(ev, text);
+    const hide = () => UI.hideMenuHelpTooltip();
+
+    help.addEventListener("mouseenter", show);
+    help.addEventListener("mousemove", show);
+    help.addEventListener("mouseleave", hide);
+    help.addEventListener("focus", (ev) => show(ev));
+    help.addEventListener("blur", hide);
+
+    return help;
+  },
+
+  appendLabelWithHelp(container, label, helpText) {
+    if (helpText) {
+      container.appendChild(UI.createHelpIcon(helpText));
+    }
+
+    const text = document.createElement("span");
+    text.className = "tm-md-label";
+    text.textContent = label;
+    container.appendChild(text);
+  },
+
+  ensureMenuHelpTooltip() {
+    if (document.getElementById("tm-md-menu-help")) return;
+    const t = document.createElement("div");
+    t.id = "tm-md-menu-help";
+    document.body.appendChild(t);
+  },
+
+  showMenuHelpTooltip(ev, text) {
+    const t = document.getElementById("tm-md-menu-help");
+    if (!t) return;
+
+    t.textContent = text;
+    t.style.display = "block";
+
+    const clientX = ev?.clientX ?? 0;
+    const clientY = ev?.clientY ?? 0;
+    const maxX = Math.max(12, window.innerWidth - 280);
+    const maxY = Math.max(12, window.innerHeight - 120);
+
+    t.style.left = Math.min(clientX + 12, maxX) + "px";
+    t.style.top = Math.min(clientY + 12, maxY) + "px";
+  },
+
+  hideMenuHelpTooltip() {
+    const t = document.getElementById("tm-md-menu-help");
+    if (t) t.style.display = "none";
   },
 
   injectMenu() {
@@ -497,10 +795,11 @@ const UI = {
 
     const btn = document.createElement("div");
     btn.id = "tm-md-btn";
-    btn.textContent = "Info ▾";
+    UI.setMenuButtonState(btn, false);
 
     const menu = document.createElement("div");
     menu.id = "tm-md-menu";
+    menu.dataset.open = "false";
 
     const infoTitle = document.createElement("div");
     infoTitle.className = "tm-md-section-title";
@@ -516,12 +815,7 @@ const UI = {
 
       const left = document.createElement("div");
       left.className = "tm-md-left";
-
-      const text = document.createElement("span");
-      text.className = "tm-md-label";
-      text.textContent = opt.label;
-
-      left.appendChild(text);
+      UI.appendLabelWithHelp(left, opt.label, Config.INFO_HELP[opt.key]);
 
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
@@ -557,6 +851,7 @@ const UI = {
     const thresholdLabel = document.createElement("label");
     thresholdLabel.className = "tm-md-control-label";
     thresholdLabel.textContent = "Mostrar productos";
+    thresholdLabel.appendChild(UI.createHelpIcon(Config.FILTER_HELP.threshold));
 
     const thresholdSelect = document.createElement("select");
     thresholdSelect.className = "tm-md-select";
@@ -586,6 +881,7 @@ const UI = {
     const modeLabel = document.createElement("label");
     modeLabel.className = "tm-md-control-label";
     modeLabel.textContent = "Acción";
+    modeLabel.appendChild(UI.createHelpIcon(Config.FILTER_HELP.mode));
 
     const modeSelect = document.createElement("select");
     modeSelect.className = "tm-md-select";
@@ -620,6 +916,7 @@ const UI = {
     hideUnknownText.className = "tm-md-label";
     hideUnknownText.textContent = "ocultar alimentos sin información";
 
+    hideUnknownLeft.appendChild(UI.createHelpIcon(Config.FILTER_HELP.hideUnknown));
     hideUnknownLeft.appendChild(hideUnknownText);
 
     const hideUnknownCheckbox = document.createElement("input");
@@ -639,6 +936,37 @@ const UI = {
     hideUnknownRow.appendChild(hideUnknownCheckbox);
     menu.appendChild(hideUnknownRow);
 
+    const hideGlutenRow = document.createElement("label");
+    hideGlutenRow.className = "tm-md-row";
+    hideGlutenRow.setAttribute("for", "tm-md-hide-gluten");
+
+    const hideGlutenLeft = document.createElement("div");
+    hideGlutenLeft.className = "tm-md-left";
+
+    const hideGlutenText = document.createElement("span");
+    hideGlutenText.className = "tm-md-label";
+    hideGlutenText.textContent = "ocultar alimentos con gluten";
+
+    hideGlutenLeft.appendChild(UI.createHelpIcon(Config.FILTER_HELP.hideGluten));
+    hideGlutenLeft.appendChild(hideGlutenText);
+
+    const hideGlutenCheckbox = document.createElement("input");
+    hideGlutenCheckbox.type = "checkbox";
+    hideGlutenCheckbox.id = "tm-md-hide-gluten";
+    hideGlutenCheckbox.className = "tm-md-check";
+    hideGlutenCheckbox.checked = !!filterOptions.hideGluten;
+
+    hideGlutenCheckbox.addEventListener("change", () => {
+      const current = Utils.getFilterOptions();
+      current.hideGluten = hideGlutenCheckbox.checked;
+      Utils.setFilterOptions(current);
+      Filters.reapplyAll();
+    });
+
+    hideGlutenRow.appendChild(hideGlutenLeft);
+    hideGlutenRow.appendChild(hideGlutenCheckbox);
+    menu.appendChild(hideGlutenRow);
+
     const note = document.createElement("div");
     note.className = "tm-md-note";
     note.textContent = "Los productos se cargan y actualizan automáticamente, sin pasar el ratón.";
@@ -648,16 +976,22 @@ const UI = {
     wrapper.appendChild(menu);
     document.body.appendChild(wrapper);
 
-    btn.addEventListener("click", () => {
-      const open = menu.style.display === "block";
-      menu.style.display = open ? "none" : "block";
-      btn.textContent = open ? "Info ▾" : "Info ▴";
+    btn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+
+      const nextOpen = menu.dataset.open !== "true";
+      menu.dataset.open = nextOpen ? "true" : "false";
+      menu.style.display = nextOpen ? "block" : "none";
+      UI.setMenuButtonState(btn, nextOpen);
     });
 
     document.addEventListener("click", (e) => {
       if (!wrapper.contains(e.target)) {
         menu.style.display = "none";
-        btn.textContent = "Info ▾";
+        menu.dataset.open = "false";
+        UI.setMenuButtonState(btn, false);
+        UI.hideMenuHelpTooltip();
       }
     });
   },
@@ -673,9 +1007,56 @@ const UI = {
         font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
       }
       #tm-md-btn{
-        cursor: pointer; border: 1px solid rgba(0,0,0,0.15); background: white;
-        padding: 10px 12px; border-radius: 10px; box-shadow: 0 6px 18px rgba(0,0,0,0.12);
+        cursor: pointer; border: 1px solid rgba(0,0,0,0.10);
+        background: linear-gradient(135deg, #fff8ec 0%, #ffffff 52%, #f4fbf6 100%);
+        padding: 10px 12px; border-radius: 14px; box-shadow: 0 10px 24px rgba(0,0,0,0.12);
         font-weight: 700; user-select: none;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-width: 188px;
+      }
+      .tm-md-btn-main{
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+      }
+      .tm-md-btn-icon{
+        width: 34px;
+        height: 34px;
+        min-width: 34px;
+        border-radius: 11px;
+        background: linear-gradient(135deg, #ffe2b2 0%, #fff1d8 100%);
+        color: #8a4b00;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: inset 0 0 0 1px rgba(138,75,0,0.10);
+      }
+      .tm-md-btn-icon svg{
+        width: 20px;
+        height: 20px;
+        fill: currentColor;
+      }
+      .tm-md-btn-text{
+        font-size: 14px;
+        color: #1f2937;
+        line-height: 1.15;
+      }
+      .tm-md-btn-chevron{
+        width: 18px;
+        height: 18px;
+        color: rgba(17,24,39,0.75);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .tm-md-btn-chevron svg{
+        width: 18px;
+        height: 18px;
+        fill: currentColor;
       }
       #tm-md-menu{
         margin-top: 10px; width: 290px; background: white; border: 1px solid rgba(0,0,0,0.12);
@@ -702,6 +1083,28 @@ const UI = {
       .tm-md-left{ display:flex; align-items:center; gap:10px; }
       .tm-md-label{ font-size: 14px; }
       .tm-md-check{ cursor: pointer; }
+      .tm-md-help{
+        width: 18px;
+        height: 18px;
+        min-width: 18px;
+        border-radius: 999px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: rgba(17,24,39,0.58);
+        background: rgba(17,24,39,0.06);
+      }
+      .tm-md-help svg{
+        width: 12px;
+        height: 12px;
+        fill: currentColor;
+      }
+      .tm-md-help:hover,
+      .tm-md-help:focus{
+        color: #0f5132;
+        background: rgba(15,81,50,0.10);
+        outline: none;
+      }
       .tm-md-control{
         display: flex;
         flex-direction: column;
@@ -711,6 +1114,9 @@ const UI = {
       .tm-md-control-label{
         font-size: 13px;
         opacity: 0.9;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
       }
       .tm-md-select{
         height: 34px;
@@ -724,6 +1130,20 @@ const UI = {
         opacity: 0.7;
         padding: 6px 8px 2px 8px;
         line-height: 1.3;
+      }
+      #tm-md-menu-help{
+        position: fixed;
+        z-index: 1000001;
+        display: none;
+        max-width: 240px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        background: rgba(17,24,39,0.96);
+        color: white;
+        font-size: 12px;
+        line-height: 1.35;
+        box-shadow: 0 12px 28px rgba(0,0,0,0.25);
+        pointer-events: none;
       }
 
       .tm-md-badge{
@@ -896,6 +1316,51 @@ const UI = {
         line-height: 1.2;
       }
 
+      .tm-md-status{
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .tm-md-status-pill{
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 24px;
+        padding: 0 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.01em;
+      }
+
+      .tm-md-status-pill.safe{
+        background: rgba(58, 185, 115, 0.18);
+        color: #b6ffd1;
+      }
+
+      .tm-md-status-pill.warning{
+        background: rgba(255, 196, 72, 0.18);
+        color: #ffe2a2;
+      }
+
+      .tm-md-status-pill.danger{
+        background: rgba(255, 106, 106, 0.18);
+        color: #ffc0c0;
+      }
+
+      .tm-md-status-pill.unknown{
+        background: rgba(255,255,255,0.10);
+        color: rgba(255,255,255,0.88);
+      }
+
+      .tm-md-status-note{
+        font-size: 11px;
+        font-weight: 600;
+        opacity: 0.74;
+      }
+
       .tm-md-tip-footer{
         opacity: 0.72;
         margin-top: 10px;
@@ -1042,6 +1507,24 @@ const UI = {
       .join("");
 
     return `<span class="tm-md-nutri">${segs}</span>`;
+  },
+
+  glutenStatusHtml(glutenInfo) {
+    const info = glutenInfo || {};
+    const status = Utils.normalizeDisplayValue(info.status);
+    const detail = Utils.normalizeDisplayValue(info.detail);
+    const tone = ["safe", "warning", "danger", "unknown"].includes(info.tone)
+      ? info.tone
+      : "unknown";
+    const detailHtml =
+      detail !== "No disponible" ? `<span class="tm-md-status-note">${Utils.escapeHtml(detail)}</span>` : "";
+
+    return `
+      <span class="tm-md-status">
+        <span class="tm-md-status-pill ${tone}">${Utils.escapeHtml(status)}</span>
+        ${detailHtml}
+      </span>
+    `;
   },
 
   infoCardHtml({ icon, label, valueHtml }) {
@@ -1201,8 +1684,10 @@ const Filters = {
     if (!card || !document.body.contains(card)) return;
 
     const filterOptions = Utils.getFilterOptions();
+    const useNutriFilter = filterOptions.threshold !== "none";
+    const useGlutenFilter = !!filterOptions.hideGluten;
 
-    if (filterOptions.threshold === "none") {
+    if (!useNutriFilter && !useGlutenFilter) {
       Filters.clearCard(card);
       return;
     }
@@ -1223,8 +1708,18 @@ const Filters = {
 
     const off = await API.getOffDataByEan(ean);
     const realGrade = String(off.nutriscoreGrade || "").toLowerCase();
+    const glutenStatus = String(off?.glutenInfo?.status || "").toLowerCase();
 
     Filters.clearCard(card);
+
+    if (useGlutenFilter && glutenStatus === "contiene gluten") {
+      card.classList.add("tm-md-hidden");
+      return;
+    }
+
+    if (!useNutriFilter) {
+      return;
+    }
 
     if (!["a", "b", "c", "d", "e"].includes(realGrade)) {
       if (filterOptions.hideUnknown) {
@@ -1325,6 +1820,16 @@ const Badges = {
           icon: Icons.additives,
           label: "Aditivos",
           valueHtml: Utils.escapeHtml(Utils.normalizeDisplayValue(Utils.formatAdditivesCount(off.additivesN))),
+        })
+      );
+    }
+
+    if (infoOptions.gluten) {
+      cards.push(
+        UI.infoCardHtml({
+          icon: Icons.gluten,
+          label: "Gluten",
+          valueHtml: UI.glutenStatusHtml(off.glutenInfo),
         })
       );
     }
