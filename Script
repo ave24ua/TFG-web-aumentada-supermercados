@@ -238,6 +238,34 @@ const Utils = {
     return fragments.some((fragment) => normalized.includes(String(fragment).toLowerCase()));
   },
 
+  makeInfoStatus(status, detail, tone = "unknown") {
+    return {
+      status: Utils.normalizeDisplayValue(status),
+      detail: Utils.normalizeDisplayValue(detail),
+      tone,
+    };
+  },
+
+  isValidNutriGrade(grade) {
+    return ["a", "b", "c", "d", "e"].includes(String(grade || "").toLowerCase());
+  },
+
+  fieldUnavailableInfo(fieldLabel, hasOffData, detailIfOff = "") {
+    if (!hasOffData) {
+      return Utils.makeInfoStatus(
+        "Sin datos OFF",
+        "Open Food Facts no tiene ficha util para este producto",
+        "missing"
+      );
+    }
+
+    return Utils.makeInfoStatus(
+      "No disponible",
+      detailIfOff || `OFF no aporta este dato para ${fieldLabel.toLowerCase()}`,
+      "unknown"
+    );
+  },
+
   saltLevelFromValue(salt100g) {
     if (salt100g == null || Number.isNaN(salt100g)) {
       return { level: null, text: "No disponible" };
@@ -410,6 +438,64 @@ const Utils = {
     };
   },
 
+  novaInfoFromValue(novaGroup, hasOffData) {
+    if (novaGroup == null || Number.isNaN(novaGroup)) {
+      return Utils.fieldUnavailableInfo("NOVA", hasOffData, "OFF no indica el grupo NOVA de este producto");
+    }
+
+    return Utils.makeInfoStatus(`Grupo ${novaGroup}`, "Clasificacion NOVA disponible", "safe");
+  },
+
+  additivesInfoFromValue(n, hasOffData) {
+    if (n == null || Number.isNaN(n)) {
+      return Utils.fieldUnavailableInfo(
+        "aditivos",
+        hasOffData,
+        "OFF no aporta un recuento de aditivos para este producto"
+      );
+    }
+
+    if (n <= 1) return Utils.makeInfoStatus(`${n} aditivos`, "Nivel bajo de aditivos", "safe");
+    if (n <= 4) return Utils.makeInfoStatus(`${n} aditivos`, "Nivel medio de aditivos", "warning");
+    return Utils.makeInfoStatus(`${n} aditivos`, "Nivel alto de aditivos", "danger");
+  },
+
+  addedSugarsInfoFromValue(text, hasOffData) {
+    const normalized = Utils.normalizeDisplayValue(text);
+    if (normalized === "No disponible") {
+      return Utils.fieldUnavailableInfo(
+        "azucares anadidos",
+        hasOffData,
+        "OFF no permite confirmar si hay azucares anadidos"
+      );
+    }
+
+    if (normalized === "Sin azúcares añadidos" || normalized === "Sin azucares añadidos") {
+      return Utils.makeInfoStatus("Sin añadidos", "OFF marca ausencia de azucares añadidos", "safe");
+    }
+
+    if (normalized === "Con azúcares añadidos" || normalized === "Con azucares añadidos") {
+      return Utils.makeInfoStatus("Con añadidos", "OFF marca presencia de azucares añadidos", "danger");
+    }
+
+    return Utils.makeInfoStatus("Probable", "Inferido a partir de ingredientes o etiquetas en OFF", "warning");
+  },
+
+  saltInfoFromValue(text, hasOffData) {
+    const normalized = Utils.normalizeDisplayValue(text);
+    if (normalized === "No disponible") {
+      return Utils.fieldUnavailableInfo(
+        "sal",
+        hasOffData,
+        "OFF no aporta el contenido de sal por 100 g o 100 ml"
+      );
+    }
+
+    if (normalized.startsWith("Bajo")) return Utils.makeInfoStatus(normalized, "Contenido bajo en sal", "safe");
+    if (normalized.startsWith("Medio")) return Utils.makeInfoStatus(normalized, "Contenido medio en sal", "warning");
+    return Utils.makeInfoStatus(normalized, "Contenido alto en sal", "danger");
+  },
+
   nutriValue(grade) {
     const map = { a: 1, b: 2, c: 3, d: 4, e: 5 };
     return map[String(grade || "").toLowerCase()] || null;
@@ -580,6 +666,7 @@ const API = {
 
       if (!res.ok) {
         const outFail = {
+          hasOffData: false,
           nutriscoreGrade: "No disponible",
           novaGroup: null,
           additivesN: null,
@@ -595,6 +682,23 @@ const API = {
 
       const json = await res.json();
       const product = json?.product || null;
+      const hasOffData = !!(product && typeof product === "object" && Object.keys(product).length > 0);
+
+      if (!hasOffData) {
+        const outMissing = {
+          hasOffData: false,
+          nutriscoreGrade: "No disponible",
+          novaGroup: null,
+          additivesN: null,
+          addedSugarsText: "No disponible",
+          glutenInfo: Utils.glutenInfoFromProduct(null),
+          salt100g: null,
+          saltLevelText: "No disponible",
+          completeness: null,
+        };
+        State.offByEan.set(ean, outMissing);
+        return outMissing;
+      }
 
       const nutriscoreGrade = Utils.normalizeDisplayValue(
         product?.nutriscore_grade ? String(product.nutriscore_grade) : null
@@ -619,6 +723,7 @@ const API = {
       const completeness = product?.completeness != null ? Number(product.completeness) : null;
 
       const out = {
+        hasOffData: true,
         nutriscoreGrade,
         novaGroup,
         additivesN,
@@ -1175,27 +1280,36 @@ const UI = {
 
       .tm-md-pass{
         position: relative;
-        background: rgba(30, 143, 77, 0.06);
-        box-shadow: inset 0 0 0 2px rgba(30, 143, 77, 0.40);
+        background: rgba(20, 138, 68, 0.16);
+        box-shadow: inset 0 0 0 3px rgba(20, 138, 68, 0.82), 0 0 0 1px rgba(20, 138, 68, 0.10);
       }
 
       .tm-md-fail{
         position: relative;
-        background: rgba(214, 69, 69, 0.06);
-        box-shadow: inset 0 0 0 2px rgba(214, 69, 69, 0.40);
+        background: rgba(214, 45, 45, 0.16);
+        box-shadow: inset 0 0 0 3px rgba(214, 45, 45, 0.84), 0 0 0 1px rgba(214, 45, 45, 0.10);
       }
 
       .tm-md-unknown{
         position: relative;
-        filter: saturate(0.95);
-        background: rgba(255, 214, 64, 0.08);
-        box-shadow: inset 0 0 0 2px rgba(255, 214, 64, 0.38);
+        filter: saturate(1.08);
+        background: rgba(255, 205, 36, 0.18);
+        box-shadow: inset 0 0 0 3px rgba(255, 189, 8, 0.86), 0 0 0 1px rgba(255, 189, 8, 0.08);
+      }
+
+      .tm-md-no-off{
+        position: relative;
+        filter: saturate(1.06);
+        background: rgba(255, 128, 24, 0.18);
+        box-shadow: inset 0 0 0 3px rgba(245, 112, 0, 0.86), 0 0 0 1px rgba(245, 112, 0, 0.08);
       }
 
       .tm-md-loading-card{
         position: relative;
-        filter: grayscale(1);
-        opacity: 0.55;
+        filter: grayscale(0.95);
+        opacity: 0.72;
+        background: rgba(107, 114, 128, 0.12);
+        box-shadow: inset 0 0 0 2px rgba(107, 114, 128, 0.46);
       }
 
       .tm-md-loading-overlay{
@@ -1238,6 +1352,16 @@ const UI = {
         text-align: center;
         line-height: 1.2;
         box-shadow: 0 6px 16px rgba(0,0,0,0.15);
+      }
+
+      .tm-md-unknown-label.warning{
+        background: rgba(255, 214, 64, 0.96);
+        color: #2f2400;
+      }
+
+      .tm-md-unknown-label.missing{
+        background: rgba(255, 151, 58, 0.96);
+        color: #3e1d00;
       }
 
       #tm-md-tooltip{
@@ -1355,6 +1479,11 @@ const UI = {
         color: rgba(255,255,255,0.88);
       }
 
+      .tm-md-status-pill.missing{
+        background: rgba(255, 151, 58, 0.18);
+        color: #ffd2ae;
+      }
+
       .tm-md-status-note{
         font-size: 11px;
         font-weight: 600;
@@ -1445,6 +1574,43 @@ const UI = {
         font-weight: 700;
       }
 
+      .tm-md-scale{
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        flex-wrap: nowrap;
+      }
+
+      .tm-md-scale-seg{
+        min-width: 18px;
+        height: 18px;
+        padding: 0 6px;
+        border-radius: 5px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 10px;
+        font-weight: 800;
+        color: rgba(255,255,255,0.78);
+        border: 1px solid rgba(255,255,255,0.08);
+        opacity: 0.48;
+      }
+
+      .tm-md-scale-seg.active{
+        opacity: 1;
+        min-width: 26px;
+        height: 22px;
+        box-shadow: 0 0 0 2px rgba(255,255,255,0.15);
+        transform: scale(1.04);
+      }
+
+      .tm-md-scale-caption{
+        margin-top: 6px;
+        font-size: 11px;
+        font-weight: 700;
+        opacity: 0.86;
+      }
+
       @keyframes tm-md-spin {
         from { transform: rotate(0deg); }
         to { transform: rotate(360deg); }
@@ -1493,9 +1659,7 @@ const UI = {
 
   nutriVisualHtml(grade) {
     const g = String(grade || "").toLowerCase();
-    if (!["a", "b", "c", "d", "e"].includes(g)) {
-      return `<span class="tm-md-nutri-unknown">No disponible</span>`;
-    }
+    if (!Utils.isValidNutriGrade(g)) return "";
 
     const letters = ["a", "b", "c", "d", "e"];
     const segs = letters
@@ -1509,11 +1673,54 @@ const UI = {
     return `<span class="tm-md-nutri">${segs}</span>`;
   },
 
-  glutenStatusHtml(glutenInfo) {
-    const info = glutenInfo || {};
+  scaleVisualHtml({ levels, activeValue, caption = "" }) {
+    const segs = levels
+      .map((level) => {
+        const active = String(level.value) === String(activeValue) ? "active" : "";
+        return `<span class="tm-md-scale-seg ${active}" style="background:${level.color}">${Utils.escapeHtml(level.label)}</span>`;
+      })
+      .join("");
+
+    const captionHtml = caption ? `<div class="tm-md-scale-caption">${Utils.escapeHtml(caption)}</div>` : "";
+    return `
+      <span class="tm-md-scale">${segs}</span>
+      ${captionHtml}
+    `;
+  },
+
+  novaVisualHtml(novaGroup) {
+    if (novaGroup == null || Number.isNaN(novaGroup)) return "";
+    return UI.scaleVisualHtml({
+      levels: [
+        { value: 1, label: "1", color: "#1e8f4d" },
+        { value: 2, label: "2", color: "#6dbd45" },
+        { value: 3, label: "3", color: "#f2c94c" },
+        { value: 4, label: "4", color: "#d64545" },
+      ],
+      activeValue: Number(novaGroup),
+      caption: `Grupo ${novaGroup}`,
+    });
+  },
+
+  additivesVisualHtml(additivesN) {
+    if (additivesN == null || Number.isNaN(additivesN)) return "";
+    const level = additivesN <= 1 ? "low" : additivesN <= 4 ? "medium" : "high";
+    return UI.scaleVisualHtml({
+      levels: [
+        { value: "low", label: "Bajo", color: "#1e8f4d" },
+        { value: "medium", label: "Medio", color: "#f2c94c" },
+        { value: "high", label: "Alto", color: "#d64545" },
+      ],
+      activeValue: level,
+      caption: `${additivesN} aditivos`,
+    });
+  },
+
+  infoStatusHtml(infoObj) {
+    const info = infoObj || {};
     const status = Utils.normalizeDisplayValue(info.status);
     const detail = Utils.normalizeDisplayValue(info.detail);
-    const tone = ["safe", "warning", "danger", "unknown"].includes(info.tone)
+    const tone = ["safe", "warning", "danger", "unknown", "missing"].includes(info.tone)
       ? info.tone
       : "unknown";
     const detailHtml =
@@ -1525,6 +1732,10 @@ const UI = {
         ${detailHtml}
       </span>
     `;
+  },
+
+  glutenStatusHtml(glutenInfo) {
+    return UI.infoStatusHtml(glutenInfo);
   },
 
   infoCardHtml({ icon, label, valueHtml }) {
@@ -1614,14 +1825,16 @@ const Dom = {
 /*          FILTERS        */
 /* <---------------------> */
 const Filters = {
-  ensureUnknownLabel(card) {
+  ensureUnknownLabel(card, { text, tone = "warning" }) {
     let label = card.querySelector(":scope > .tm-md-unknown-label");
     if (!label) {
       label = document.createElement("div");
       label.className = "tm-md-unknown-label";
       card.appendChild(label);
     }
-    label.textContent = "Nistriscore No Disponible";
+    label.classList.remove("warning", "missing");
+    label.classList.add(tone);
+    label.textContent = text;
   },
 
   ensureLoadingOverlay(card) {
@@ -1644,6 +1857,7 @@ const Filters = {
       "tm-md-muted",
       "tm-md-hidden",
       "tm-md-unknown",
+      "tm-md-no-off",
       "tm-md-pass",
       "tm-md-fail",
       "tm-md-loading-card"
@@ -1721,12 +1935,28 @@ const Filters = {
       return;
     }
 
-    if (!["a", "b", "c", "d", "e"].includes(realGrade)) {
+    if (!off.hasOffData) {
+      if (filterOptions.hideUnknown) {
+        card.classList.add("tm-md-hidden");
+      } else {
+        card.classList.add("tm-md-no-off");
+        Filters.ensureUnknownLabel(card, {
+          text: "Información OFF no disponible",
+          tone: "missing",
+        });
+      }
+      return;
+    }
+
+    if (!Utils.isValidNutriGrade(realGrade)) {
       if (filterOptions.hideUnknown) {
         card.classList.add("tm-md-hidden");
       } else {
         card.classList.add("tm-md-unknown");
-        Filters.ensureUnknownLabel(card);
+        Filters.ensureUnknownLabel(card, {
+          text: "Nutri-Score no disponible",
+          tone: "warning",
+        });
       }
       return;
     }
@@ -1792,34 +2022,50 @@ const Badges = {
 
   buildCardsHtml(off, infoOptions) {
     const cards = [];
+    const hasOffData = !!off?.hasOffData;
 
     if (infoOptions.nutriscore) {
       const realGrade = String(off.nutriscoreGrade || "").toLowerCase();
+      const nutriInfo = !hasOffData
+        ? Utils.fieldUnavailableInfo("Nutri-Score", false)
+        : !Utils.isValidNutriGrade(realGrade)
+        ? Utils.makeInfoStatus(
+            "Sin Nutri-Score",
+            "OFF tiene ficha pero no incluye Nutri-Score para este producto",
+            "warning"
+          )
+        : null;
       cards.push(
         UI.infoCardHtml({
           icon: Icons.info,
           label: "Nutri-Score",
-          valueHtml: UI.nutriVisualHtml(realGrade),
+          valueHtml: nutriInfo ? UI.infoStatusHtml(nutriInfo) : UI.nutriVisualHtml(realGrade),
         })
       );
     }
 
     if (infoOptions.nova) {
+      const novaMissing = off.novaGroup == null || Number.isNaN(off.novaGroup);
       cards.push(
         UI.infoCardHtml({
           icon: Icons.nova,
           label: "NOVA",
-          valueHtml: Utils.escapeHtml(Utils.normalizeDisplayValue(Utils.formatNovaGroup(off.novaGroup))),
+          valueHtml: novaMissing
+            ? UI.infoStatusHtml(Utils.novaInfoFromValue(off.novaGroup, hasOffData))
+            : UI.novaVisualHtml(off.novaGroup),
         })
       );
     }
 
     if (infoOptions.additives) {
+      const additivesMissing = off.additivesN == null || Number.isNaN(off.additivesN);
       cards.push(
         UI.infoCardHtml({
           icon: Icons.additives,
           label: "Aditivos",
-          valueHtml: Utils.escapeHtml(Utils.normalizeDisplayValue(Utils.formatAdditivesCount(off.additivesN))),
+          valueHtml: additivesMissing
+            ? UI.infoStatusHtml(Utils.additivesInfoFromValue(off.additivesN, hasOffData))
+            : UI.additivesVisualHtml(off.additivesN),
         })
       );
     }
@@ -1829,7 +2075,9 @@ const Badges = {
         UI.infoCardHtml({
           icon: Icons.gluten,
           label: "Gluten",
-          valueHtml: UI.glutenStatusHtml(off.glutenInfo),
+          valueHtml: UI.glutenStatusHtml(
+            hasOffData ? off.glutenInfo : Utils.fieldUnavailableInfo("gluten", false)
+          ),
         })
       );
     }
@@ -1839,7 +2087,7 @@ const Badges = {
         UI.infoCardHtml({
           icon: Icons.sugar,
           label: "Azúcares añadidos",
-          valueHtml: Utils.escapeHtml(Utils.normalizeDisplayValue(Utils.formatAddedSugars(off.addedSugarsText))),
+          valueHtml: UI.infoStatusHtml(Utils.addedSugarsInfoFromValue(off.addedSugarsText, hasOffData)),
         })
       );
     }
@@ -1849,7 +2097,7 @@ const Badges = {
         UI.infoCardHtml({
           icon: Icons.salt,
           label: "Nivel de sal",
-          valueHtml: Utils.escapeHtml(Utils.normalizeDisplayValue(Utils.formatSaltLevel(off.saltLevelText))),
+          valueHtml: UI.infoStatusHtml(Utils.saltInfoFromValue(off.saltLevelText, hasOffData)),
         })
       );
     }
@@ -1943,7 +2191,9 @@ const Badges = {
         const cardsHtml = Badges.buildCardsHtml(off, infoOptions);
 
         let warn = "";
-        if (off.completeness != null && off.completeness < 0.4) {
+        if (!off.hasOffData) {
+          warn = "Open Food Facts no tiene una ficha util para este producto.";
+        } else if (off.completeness != null && off.completeness < 0.4) {
           warn = "Datos incompletos en Open Food Facts (puede faltar información).";
         }
 
