@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "NutriVisor",
+  "short_name": "NutriVisor",
+  "version": "1.0.0",
+  "description": "Muestra informacion nutricional ampliada y filtros visuales en Mercadona con datos de Open Food Facts.",
+  "icons": {
+    "128": "Icon.png"
+  },
+  "permissions": [
+    "storage"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://tienda.mercadona.es/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
