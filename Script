@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Mercadona - Info nutricional visual + filtros por Nutri-Score
 // @namespace    http://tampermonkey.net/
-// @version      1.8.0
-// @description  Icono de información por producto. Tooltip visual con Nutri-Score, NOVA, aditivos, azúcares añadidos y nivel de sal. Filtro visual por Nutri-Score con estados de carga.
+// @version      1.9.0
+// @description  Icono de información por producto. Tooltip visual con Nutri-Score, NOVA, aditivos, alérgenos, fibra, proteínas y nivel de sal. Filtro visual por Nutri-Score con estados de carga.
 // @match        https://tienda.mercadona.es/*
 // @run-at       document-start
 // @grant        none
@@ -24,6 +24,15 @@ const Config = {
     name: ['[data-testid="product-cell-name"]', ".product-cell__description-name", "h4", "h3"],
     price: ['[data-testid="product-price"]', ".product-price__unit-price"],
     openDetailBtn: '[data-testid="open-product-detail"]',
+    detailRoots: [
+      '[data-testid="product-detail"]',
+      '[data-testid="modal"]',
+      '[role="dialog"][aria-modal="true"]',
+      '[role="dialog"]',
+      '.product-detail',
+      '.modal-container',
+      '.modal-dialog',
+    ],
   },
 
   MUTATION_DEBOUNCE_MS: 250,
@@ -33,6 +42,15 @@ const Config = {
   STORAGE: {
     infoOptionsKey: "tm_md_tooltip_options_v4",
     filterOptionsKey: "tm_md_filter_options_v3",
+    cacheEanByIdKey: "tm_md_cache_eanById_v1",
+    cacheOffByEanKey: "tm_md_cache_offByEan_v3",
+    cacheIdByNameKey: "tm_md_cache_idByNameKey_v1",
+  },
+
+  CACHE_TTL: {
+    eanByIdMs: 30 * 24 * 60 * 60 * 1000,
+    offByEanMs: 7 * 24 * 60 * 60 * 1000,
+    idByNameKeyMs: 7 * 24 * 60 * 60 * 1000,
   },
 
   INFO_OPTIONS: [
@@ -40,7 +58,9 @@ const Config = {
     { key: "nova", label: "NOVA (procesado)" },
     { key: "additives", label: "Aditivos" },
     { key: "gluten", label: "Gluten" },
-    { key: "added_sugars", label: "Azúcares añadidos" },
+    { key: "allergens", label: "Alérgenos" },
+    { key: "fiber", label: "Fibra" },
+    { key: "proteins", label: "Proteínas" },
     { key: "salt_level", label: "Nivel de sal" },
   ],
 
@@ -49,14 +69,17 @@ const Config = {
     nova: "Indica el grado de procesamiento industrial del alimento segun la clasificacion NOVA.",
     additives: "Muestra cuantos aditivos detecta Open Food Facts para ese producto.",
     gluten: "Se basa en alergenos, trazas y etiquetas de OFF para indicar si contiene gluten o no.",
-    added_sugars: "Intenta detectar si el producto tiene azucares añadidos usando datos y etiquetas de OFF.",
+    allergens: "Resume los alergenos y trazas declarados por Open Food Facts para ese producto.",
+    fiber: "Muestra la cantidad de fibra por 100 g o 100 ml y la clasifica visualmente.",
+    proteins: "Muestra la cantidad de proteínas por 100 g o 100 ml y la clasifica visualmente.",
     salt_level: "Clasifica la sal por cada 100 g o 100 ml en bajo, medio o alto.",
   },
 
   FILTER_HELP: {
     threshold: "Define el Nutri-Score minimo que aceptas para mostrar el producto como valido.",
     mode: "Decide si los productos que no cumplen se ocultan o solo se remarcan en rojo.",
-    hideUnknown: "Oculta productos sin Nutri-Score disponible en Open Food Facts.",
+    hideNoNutriScore: "Oculta productos que tienen ficha en Open Food Facts pero no incluyen Nutri-Score.",
+    hideNoInfo: "Oculta productos para los que Open Food Facts no tiene una ficha util.",
     hideGluten: "Oculta productos que OFF marca como contienen gluten.",
   },
 
@@ -82,6 +105,7 @@ const State = {
   offByEan: new Map(),
   idByNameKey: new Map(),
   inFlight: new Map(),
+  persistentHydrated: false,
 
   uiInjected: false,
 
@@ -101,6 +125,160 @@ const Runtime = {
     Runtime.reapplyTimer = setTimeout(() => {
       Filters.reapplyAll();
     }, 250);
+  },
+};
+
+/* <---------------------> */
+/*     PERSISTENT CACHE    */
+/* <---------------------> */
+const PersistentCache = {
+  stores: {
+    eanById: null,
+    offByEan: null,
+    idByNameKey: null,
+  },
+
+  loadStore(storageKey) {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      try {
+        localStorage.setItem(storageKey, JSON.stringify({}));
+      } catch {}
+      return {};
+    }
+  },
+
+  saveStore(storageKey, obj) {
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(obj || {}));
+    } catch {}
+  },
+
+  cleanupExpiredEntries(storeObj, ttlMs) {
+    const out = {};
+    const now = Date.now();
+    const src = storeObj && typeof storeObj === "object" ? storeObj : {};
+
+    for (const [key, entry] of Object.entries(src)) {
+      if (!entry || typeof entry !== "object") continue;
+      const ts = Number(entry.ts);
+      if (!Number.isFinite(ts)) continue;
+      if (now - ts > ttlMs) continue;
+      out[key] = { value: entry.value, ts };
+    }
+
+    return out;
+  },
+
+  getValidEntry(storeObj, key, ttlMs) {
+    const entry = storeObj?.[key];
+    if (!entry || typeof entry !== "object") return null;
+    const ts = Number(entry.ts);
+    if (!Number.isFinite(ts)) return null;
+    if (Date.now() - ts > ttlMs) return null;
+    return entry.value;
+  },
+
+  setEntry(storeObj, key, value) {
+    storeObj[key] = {
+      value,
+      ts: Date.now(),
+    };
+  },
+
+  ensureHydrated() {
+    if (!State.persistentHydrated) {
+      PersistentCache.hydrateStateFromLocalStorage();
+    }
+  },
+
+  hydrateStateFromLocalStorage() {
+    const eanStore = PersistentCache.cleanupExpiredEntries(
+      PersistentCache.loadStore(Config.STORAGE.cacheEanByIdKey),
+      Config.CACHE_TTL.eanByIdMs
+    );
+    const offStore = PersistentCache.cleanupExpiredEntries(
+      PersistentCache.loadStore(Config.STORAGE.cacheOffByEanKey),
+      Config.CACHE_TTL.offByEanMs
+    );
+    const idStore = PersistentCache.cleanupExpiredEntries(
+      PersistentCache.loadStore(Config.STORAGE.cacheIdByNameKey),
+      Config.CACHE_TTL.idByNameKeyMs
+    );
+
+    PersistentCache.stores.eanById = eanStore;
+    PersistentCache.stores.offByEan = offStore;
+    PersistentCache.stores.idByNameKey = idStore;
+
+    PersistentCache.saveStore(Config.STORAGE.cacheEanByIdKey, eanStore);
+    PersistentCache.saveStore(Config.STORAGE.cacheOffByEanKey, offStore);
+    PersistentCache.saveStore(Config.STORAGE.cacheIdByNameKey, idStore);
+
+    for (const [id, entry] of Object.entries(eanStore)) {
+      if (entry?.value != null) State.eanById.set(String(id), String(entry.value));
+    }
+
+    for (const [ean, entry] of Object.entries(offStore)) {
+      if (entry?.value && typeof entry.value === "object") State.offByEan.set(String(ean), entry.value);
+    }
+
+    for (const [nameKey, entry] of Object.entries(idStore)) {
+      if (entry?.value != null) State.idByNameKey.set(String(nameKey), String(entry.value));
+    }
+
+    State.persistentHydrated = true;
+  },
+
+  getEanById(id) {
+    PersistentCache.ensureHydrated();
+    return PersistentCache.getValidEntry(
+      PersistentCache.stores.eanById,
+      String(id),
+      Config.CACHE_TTL.eanByIdMs
+    );
+  },
+
+  getOffByEan(ean) {
+    PersistentCache.ensureHydrated();
+    return PersistentCache.getValidEntry(
+      PersistentCache.stores.offByEan,
+      String(ean),
+      Config.CACHE_TTL.offByEanMs
+    );
+  },
+
+  getIdByNameKey(nameKey) {
+    PersistentCache.ensureHydrated();
+    return PersistentCache.getValidEntry(
+      PersistentCache.stores.idByNameKey,
+      String(nameKey),
+      Config.CACHE_TTL.idByNameKeyMs
+    );
+  },
+
+  persistEanById(id, ean) {
+    if (id == null || !ean) return;
+    PersistentCache.ensureHydrated();
+    PersistentCache.setEntry(PersistentCache.stores.eanById, String(id), String(ean));
+    PersistentCache.saveStore(Config.STORAGE.cacheEanByIdKey, PersistentCache.stores.eanById);
+  },
+
+  persistOffByEan(ean, offData) {
+    if (!ean || !offData || typeof offData !== "object") return;
+    PersistentCache.ensureHydrated();
+    PersistentCache.setEntry(PersistentCache.stores.offByEan, String(ean), offData);
+    PersistentCache.saveStore(Config.STORAGE.cacheOffByEanKey, PersistentCache.stores.offByEan);
+  },
+
+  persistIdByNameKey(nameKey, id) {
+    if (!nameKey || id == null) return;
+    PersistentCache.ensureHydrated();
+    PersistentCache.setEntry(PersistentCache.stores.idByNameKey, String(nameKey), String(id));
+    PersistentCache.saveStore(Config.STORAGE.cacheIdByNameKey, PersistentCache.stores.idByNameKey);
   },
 };
 
@@ -176,7 +354,9 @@ const Utils = {
       nova: true,
       additives: true,
       gluten: true,
-      added_sugars: true,
+      allergens: true,
+      fiber: true,
+      proteins: true,
       salt_level: true,
     };
   },
@@ -186,10 +366,13 @@ const Utils = {
       const raw = localStorage.getItem(Config.STORAGE.filterOptionsKey);
       if (!raw) return Utils.defaultFilterOptions();
       const obj = JSON.parse(raw);
+      const legacyHideUnknown = !!obj?.hideUnknown;
       return {
         threshold: obj?.threshold || "none",
         mode: obj?.mode || "mark",
-        hideUnknown: !!obj?.hideUnknown,
+        hideNoNutriScore:
+          "hideNoNutriScore" in (obj || {}) ? !!obj?.hideNoNutriScore : legacyHideUnknown,
+        hideNoInfo: !!obj?.hideNoInfo,
         hideGluten: !!obj?.hideGluten,
       };
     } catch {
@@ -205,7 +388,8 @@ const Utils = {
     return {
       threshold: "none",
       mode: "mark",
-      hideUnknown: false,
+      hideNoNutriScore: false,
+      hideNoInfo: false,
       hideGluten: false,
     };
   },
@@ -277,97 +461,61 @@ const Utils = {
     return { level: "alto", text: `Alto (${v.toFixed(2)} g/100g)` };
   },
 
-  addedSugarsFromTags(tags) {
-    const set = new Set((tags || []).map((t) => String(t).toLowerCase()));
-
-    if (set.has("en:no-added-sugars") || set.has("en:unsweetened")) return "Sin azúcares añadidos";
-    if (
-      set.has("en:added-sugars") ||
-      set.has("en:has-added-sugars") ||
-      set.has("en:sweetened") ||
-      set.has("en:with-added-sugars")
-    ) {
-      return "Con azúcares añadidos";
-    }
-
-    return "No disponible";
+  humanizeTag(tag) {
+    return String(tag || "")
+      .replace(/^([a-z]{2}):/i, "")
+      .replace(/-/g, " ")
+      .replace(/\b\w/g, (c) => c.toUpperCase())
+      .trim();
   },
 
-  addedSugarsFromProduct(product) {
-    const analysisTags = Utils.toStringArray(product?.ingredients_analysis_tags || product?.ingredients_analysis);
-    const labelsTags = Utils.toStringArray(product?.labels_tags || product?.labels_hierarchy);
-    const ingredientTags = Utils.toStringArray(product?.ingredients_tags);
-    const ingredientText = [
-      product?.ingredients_text,
-      product?.ingredients_text_es,
-      product?.ingredients_text_en,
-    ]
-      .filter(Boolean)
-      .join(" | ");
+  uniqueNonEmpty(values) {
+    return [...new Set(Utils.toStringArray(values).filter(Boolean))];
+  },
 
-    if (
-      Utils.hasAnyExactTag(analysisTags, ["en:no-added-sugars", "en:unsweetened"]) ||
-      Utils.hasAnyExactTag(labelsTags, [
-        "en:no-added-sugar",
-        "en:no-added-sugars",
-        "en:without-added-sugars",
-        "en:unsweetened",
-      ])
-    ) {
-      return "Sin az\u00facares a\u00f1adidos";
+  allergensInfoFromProduct(product) {
+    const allergens = Utils.uniqueNonEmpty(product?.allergens_tags || product?.allergens_hierarchy).filter((tag) =>
+      !String(tag).toLowerCase().includes("en:none")
+    );
+    const traces = Utils.uniqueNonEmpty(product?.traces_tags || product?.traces_hierarchy).filter((tag) =>
+      !String(tag).toLowerCase().includes("en:none")
+    );
+
+    if (!product || (!allergens.length && !traces.length)) {
+      return Utils.makeInfoStatus(
+        "No disponible",
+        "OFF no aporta alergenos o trazas estructurados para este producto",
+        "unknown"
+      );
     }
 
-    if (
-      Utils.hasAnyExactTag(analysisTags, [
-        "en:added-sugars",
-        "en:has-added-sugars",
-        "en:with-added-sugars",
-        "en:sweetened",
-      ]) ||
-      Utils.hasAnyTagFragment(labelsTags, ["added-sugar", "added-sugars", "sweetened"])
-    ) {
-      return "Con az\u00facares a\u00f1adidos";
+    if (allergens.length && traces.length) {
+      return {
+        status: `${allergens.length} alérgenos`,
+        detail: `${traces.length} trazas`,
+        tone: "danger",
+        allergens,
+        traces,
+      };
     }
 
-    const addedSugarFragments = [
-      "azucar",
-      "az\u00facar",
-      "sucre",
-      "sugar",
-      "glucose",
-      "glucose-fructose",
-      "glucose syrup",
-      "jarabe de glucosa",
-      "jarabe de glucosa-fructosa",
-      "fructose",
-      "fructosa",
-      "dextrose",
-      "dextrosa",
-      "maltose",
-      "maltosa",
-      "maltodextrin",
-      "maltodextrina",
-      "honey",
-      "miel",
-      "caramel",
-      "caramelo",
-      "molasses",
-      "melaza",
-      "sucrose",
-      "sacarosa",
-      "agave",
-      "sirope",
-      "syrup",
-    ];
-
-    if (
-      Utils.hasAnyTagFragment(ingredientTags, addedSugarFragments) ||
-      Utils.textContainsAny(ingredientText, addedSugarFragments)
-    ) {
-      return "Probablemente con az\u00facares a\u00f1adidos";
+    if (allergens.length) {
+      return {
+        status: `${allergens.length} alérgenos`,
+        detail: "Alergenos declarados",
+        tone: "danger",
+        allergens,
+        traces: [],
+      };
     }
 
-    return "No disponible";
+    return {
+      status: `${traces.length} trazas`,
+      detail: "Trazas declaradas",
+      tone: "warning",
+      allergens: [],
+      traces,
+    };
   },
 
   glutenInfoFromProduct(product) {
@@ -460,25 +608,28 @@ const Utils = {
     return Utils.makeInfoStatus(`${n} aditivos`, "Nivel alto de aditivos", "danger");
   },
 
-  addedSugarsInfoFromValue(text, hasOffData) {
-    const normalized = Utils.normalizeDisplayValue(text);
-    if (normalized === "No disponible") {
+  fiberInfoFromValue(value, hasOffData) {
+    if (value == null || Number.isNaN(value)) {
+      return Utils.fieldUnavailableInfo("fibra", hasOffData, "OFF no aporta la fibra por 100 g o 100 ml");
+    }
+
+    if (value < 3) return Utils.makeInfoStatus(`${value.toFixed(1)} g`, "Nivel bajo de fibra", "warning");
+    if (value < 6) return Utils.makeInfoStatus(`${value.toFixed(1)} g`, "Nivel medio de fibra", "safe");
+    return Utils.makeInfoStatus(`${value.toFixed(1)} g`, "Nivel alto de fibra", "safe");
+  },
+
+  proteinsInfoFromValue(value, hasOffData) {
+    if (value == null || Number.isNaN(value)) {
       return Utils.fieldUnavailableInfo(
-        "azucares anadidos",
+        "proteinas",
         hasOffData,
-        "OFF no permite confirmar si hay azucares anadidos"
+        "OFF no aporta las proteínas por 100 g o 100 ml"
       );
     }
 
-    if (normalized === "Sin azúcares añadidos" || normalized === "Sin azucares añadidos") {
-      return Utils.makeInfoStatus("Sin añadidos", "OFF marca ausencia de azucares añadidos", "safe");
-    }
-
-    if (normalized === "Con azúcares añadidos" || normalized === "Con azucares añadidos") {
-      return Utils.makeInfoStatus("Con añadidos", "OFF marca presencia de azucares añadidos", "danger");
-    }
-
-    return Utils.makeInfoStatus("Probable", "Inferido a partir de ingredientes o etiquetas en OFF", "warning");
+    if (value < 5) return Utils.makeInfoStatus(`${value.toFixed(1)} g`, "Nivel bajo de proteínas", "warning");
+    if (value < 10) return Utils.makeInfoStatus(`${value.toFixed(1)} g`, "Nivel medio de proteínas", "safe");
+    return Utils.makeInfoStatus(`${value.toFixed(1)} g`, "Nivel alto de proteínas", "safe");
   },
 
   saltInfoFromValue(text, hasOffData) {
@@ -494,6 +645,30 @@ const Utils = {
     if (normalized.startsWith("Bajo")) return Utils.makeInfoStatus(normalized, "Contenido bajo en sal", "safe");
     if (normalized.startsWith("Medio")) return Utils.makeInfoStatus(normalized, "Contenido medio en sal", "warning");
     return Utils.makeInfoStatus(normalized, "Contenido alto en sal", "danger");
+  },
+
+  hasMeaningfulOffData(offData) {
+    if (!offData || typeof offData !== "object") return false;
+
+    if (Utils.isValidNutriGrade(offData.nutriscoreGrade)) return true;
+    if (offData.novaGroup != null && !Number.isNaN(offData.novaGroup)) return true;
+    if (offData.additivesN != null && !Number.isNaN(offData.additivesN)) return true;
+    if (offData.fiber100g != null && !Number.isNaN(offData.fiber100g)) return true;
+    if (offData.proteins100g != null && !Number.isNaN(offData.proteins100g)) return true;
+    if (offData.salt100g != null && !Number.isNaN(offData.salt100g)) return true;
+
+    const glutenStatus = Utils.normalizeDisplayValue(offData?.glutenInfo?.status);
+    if (glutenStatus !== "No disponible") return true;
+
+    const allergens = Array.isArray(offData?.allergensInfo?.allergens)
+      ? offData.allergensInfo.allergens.filter(Boolean)
+      : [];
+    const traces = Array.isArray(offData?.allergensInfo?.traces)
+      ? offData.allergensInfo.traces.filter(Boolean)
+      : [];
+    if (allergens.length || traces.length) return true;
+
+    return false;
   },
 
   nutriValue(grade) {
@@ -517,18 +692,6 @@ const Utils = {
   formatAdditivesCount(n) {
     if (n == null || Number.isNaN(n)) return "No disponible";
     return `${n}`;
-  },
-
-  formatAddedSugars(text) {
-    const normalized = Utils.normalizeDisplayValue(text);
-    if (normalized === "Sin az\u00facares a\u00f1adidos") return "Sin a\u00f1adidos";
-    if (normalized === "Con az\u00facares a\u00f1adidos") return "Con a\u00f1adidos";
-    if (normalized === "Probablemente con az\u00facares a\u00f1adidos") {
-      return "Probablemente con a\u00f1adidos";
-    }
-    if (normalized === "Sin azúcares añadidos") return "Sin añadidos";
-    if (normalized === "Con azúcares añadidos") return "Con añadidos";
-    return "No disponible";
   },
 
   formatSaltLevel(text) {
@@ -579,11 +742,14 @@ const Indexer = {
     const ean = json.ean;
     if (id && ean) {
       State.eanById.set(String(id), String(ean));
+      PersistentCache.persistEanById(id, ean);
 
       const name = json.display_name || json.name;
       const brand = json.brand;
       if (name) {
-        State.idByNameKey.set(Utils.nameKey(name, brand), String(id));
+        const key = Utils.nameKey(name, brand);
+        State.idByNameKey.set(key, String(id));
+        PersistentCache.persistIdByNameKey(key, id);
         Runtime.scheduleReapplyFilters();
       }
     }
@@ -613,6 +779,7 @@ const Indexer = {
         const key = Utils.nameKey(name, brand);
         if (!State.idByNameKey.has(key)) {
           State.idByNameKey.set(key, String(id));
+          PersistentCache.persistIdByNameKey(key, id);
           Runtime.scheduleReapplyFilters();
         }
       }
@@ -628,6 +795,11 @@ const Indexer = {
 const API = {
   async getEanById(id) {
     if (State.eanById.has(id)) return State.eanById.get(id);
+    const cachedEan = PersistentCache.getEanById(id);
+    if (cachedEan) {
+      State.eanById.set(String(id), String(cachedEan));
+      return String(cachedEan);
+    }
 
     const key = `ean_${id}`;
     if (State.inFlight.has(key)) return State.inFlight.get(key);
@@ -638,11 +810,18 @@ const API = {
 
       const json = await res.json();
       const ean = json?.ean ? String(json.ean) : null;
-      if (ean) State.eanById.set(String(id), ean);
+      if (ean) {
+        State.eanById.set(String(id), ean);
+        PersistentCache.persistEanById(id, ean);
+      }
 
       const n = json?.display_name || json?.name;
       const b = json?.brand;
-      if (n && json?.id) State.idByNameKey.set(Utils.nameKey(n, b), String(json.id));
+      if (n && json?.id) {
+        const nameKey = Utils.nameKey(n, b);
+        State.idByNameKey.set(nameKey, String(json.id));
+        PersistentCache.persistIdByNameKey(nameKey, json.id);
+      }
 
       return ean;
     })();
@@ -657,6 +836,11 @@ const API = {
 
   async getOffDataByEan(ean) {
     if (State.offByEan.has(ean)) return State.offByEan.get(ean);
+    const cachedOff = PersistentCache.getOffByEan(ean);
+    if (cachedOff && typeof cachedOff === "object") {
+      State.offByEan.set(String(ean), cachedOff);
+      return cachedOff;
+    }
 
     const key = `off_${ean}`;
     if (State.inFlight.has(key)) return State.inFlight.get(key);
@@ -670,13 +854,16 @@ const API = {
           nutriscoreGrade: "No disponible",
           novaGroup: null,
           additivesN: null,
-          addedSugarsText: "No disponible",
           glutenInfo: Utils.glutenInfoFromProduct(null),
+          allergensInfo: Utils.makeInfoStatus("No disponible", "OFF no aporta alergenos para este producto", "unknown"),
+          fiber100g: null,
+          proteins100g: null,
           salt100g: null,
           saltLevelText: "No disponible",
           completeness: null,
         };
         State.offByEan.set(ean, outFail);
+        PersistentCache.persistOffByEan(ean, outFail);
         return outFail;
       }
 
@@ -690,13 +877,16 @@ const API = {
           nutriscoreGrade: "No disponible",
           novaGroup: null,
           additivesN: null,
-          addedSugarsText: "No disponible",
           glutenInfo: Utils.glutenInfoFromProduct(null),
+          allergensInfo: Utils.makeInfoStatus("No disponible", "OFF no aporta alergenos para este producto", "unknown"),
+          fiber100g: null,
+          proteins100g: null,
           salt100g: null,
           saltLevelText: "No disponible",
           completeness: null,
         };
         State.offByEan.set(ean, outMissing);
+        PersistentCache.persistOffByEan(ean, outMissing);
         return outMissing;
       }
 
@@ -712,8 +902,16 @@ const API = {
           ? product.additives_tags.length
           : null;
 
-      const addedSugarsText = Utils.normalizeDisplayValue(Utils.addedSugarsFromProduct(product));
       const glutenInfo = Utils.glutenInfoFromProduct(product);
+      const allergensInfo = Utils.allergensInfoFromProduct(product);
+
+      const fiberRaw =
+        product?.nutriments?.fiber_100g != null ? product.nutriments.fiber_100g : null;
+      const fiber100g = fiberRaw != null ? Number(fiberRaw) : null;
+
+      const proteinsRaw =
+        product?.nutriments?.proteins_100g != null ? product.nutriments.proteins_100g : null;
+      const proteins100g = proteinsRaw != null ? Number(proteinsRaw) : null;
 
       const saltRaw =
         product?.nutriments?.salt_100g != null ? product.nutriments.salt_100g : null;
@@ -727,14 +925,19 @@ const API = {
         nutriscoreGrade,
         novaGroup,
         additivesN,
-        addedSugarsText,
         glutenInfo,
+        allergensInfo,
+        fiber100g,
+        proteins100g,
         salt100g,
         saltLevelText: Utils.normalizeDisplayValue(saltLevel.text),
         completeness,
       };
 
+      out.hasOffData = Utils.hasMeaningfulOffData(out);
+
       State.offByEan.set(ean, out);
+      PersistentCache.persistOffByEan(ean, out);
       return out;
     })();
 
@@ -794,9 +997,19 @@ const Icons = {
       <path d="M12 2c2.4 0 4 2.2 4 4.9 0 1.9-.8 3.2-1.8 4.6-.8 1.1-1.7 2.3-2.2 4V22h-2v-6.5c-.5-1.7-1.3-2.9-2.1-4C6.8 10.1 6 8.8 6 6.9 6 4.2 7.6 2 10 2c.8 0 1.5.2 2 .7.5-.5 1.2-.7 2-.7zm-2 2c-1.2 0-2 1.3-2 2.9 0 1.2.5 2.1 1.3 3.2.2.3.5.7.7 1 .2-.3.5-.7.7-1 .8-1.1 1.3-2 1.3-3.2C12 5.3 11.2 4 10 4zm4 0c-1.2 0-2 1.3-2 2.9 0 1.2.5 2.1 1.3 3.2.2.3.5.7.7 1 .2-.3.5-.7.7-1 .8-1.1 1.3-2 1.3-3.2C16 5.3 15.2 4 14 4z"/>
     </svg>
   `,
-  sugar: `
+  allergens: `
     <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M8.5 4h7l3.5 5-7 11-7-11 3.5-5zm1.3 2L8 8.6l4 6.3 4-6.3L14.2 6H9.8z"/>
+      <path d="M12 2.5c3.4 0 6.1 2.7 6.1 6.1 0 3.8-3.2 5.8-5.1 8.7-.4.6-.6 1.3-.7 2h-1.8c-.1-.7-.3-1.4-.7-2C8 14.4 4.8 12.4 4.8 8.6A6.1 6.1 0 0112 2.5zm0 3a3.1 3.1 0 00-3.1 3.1c0 1.3.7 2.3 1.8 3.4.5.5 1 1.1 1.3 1.7.3-.6.8-1.2 1.3-1.7 1.1-1.1 1.8-2.1 1.8-3.4A3.1 3.1 0 0012 5.5z"/>
+    </svg>
+  `,
+  fiber: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M18.5 3C14 3 9.7 6 8.1 10.2c-.9 2.4-.8 5.2.3 7.3-1.6.4-3.1 1.2-4.4 2.5l1.1 1.1c1.4-1.4 3.2-2.1 5.1-2.1 6.6 0 10.8-4.2 10.8-10.8 0-1.6-.4-3.3-1.2-5.2h-1.3zm-1.3 2.3c.4 1 .5 2 .5 2.9 0 4.9-2.9 8-7.8 8-.5 0-.9 0-1.4-.1 2.4-1.4 4.8-3.7 7.3-7.1l-1.2-.9c-2.3 3.1-4.5 5.2-6.6 6.4-.4-1.2-.3-2.6.2-4 1.1-2.8 4.1-5.2 9-5.5z"/>
+    </svg>
+  `,
+  proteins: `
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M8.3 4.2c1.8 0 3.1.9 4.3 2.3 1.2-1.4 2.5-2.3 4.3-2.3C19.3 4.2 21 6 21 8.4c0 5.3-4.8 8.2-8.4 11.4C9 16.6 4.2 13.7 4.2 8.4c0-2.4 1.7-4.2 4.1-4.2zm0 1.8C7 6 6 7 6 8.4c0 4.1 3.9 6.5 6.6 8.8 2.7-2.3 6.6-4.7 6.6-8.8 0-1.4-1-2.4-2.3-2.4-1.2 0-2.1.7-3.5 2.6l-.8 1.1-.8-1.1C10.4 6.7 9.5 6 8.3 6z"/>
     </svg>
   `,
   salt: `
@@ -1010,36 +1223,67 @@ const UI = {
     modeRow.appendChild(modeSelect);
     menu.appendChild(modeRow);
 
-    const hideUnknownRow = document.createElement("label");
-    hideUnknownRow.className = "tm-md-row";
-    hideUnknownRow.setAttribute("for", "tm-md-hide-unknown");
+    const hideNoNutriScoreRow = document.createElement("label");
+    hideNoNutriScoreRow.className = "tm-md-row";
+    hideNoNutriScoreRow.setAttribute("for", "tm-md-hide-no-nutriscore");
 
-    const hideUnknownLeft = document.createElement("div");
-    hideUnknownLeft.className = "tm-md-left";
+    const hideNoNutriScoreLeft = document.createElement("div");
+    hideNoNutriScoreLeft.className = "tm-md-left";
 
-    const hideUnknownText = document.createElement("span");
-    hideUnknownText.className = "tm-md-label";
-    hideUnknownText.textContent = "ocultar alimentos sin información";
+    const hideNoNutriScoreText = document.createElement("span");
+    hideNoNutriScoreText.className = "tm-md-label";
+    hideNoNutriScoreText.textContent = "ocultar alimentos sin Nutri-Score";
 
-    hideUnknownLeft.appendChild(UI.createHelpIcon(Config.FILTER_HELP.hideUnknown));
-    hideUnknownLeft.appendChild(hideUnknownText);
+    hideNoNutriScoreLeft.appendChild(UI.createHelpIcon(Config.FILTER_HELP.hideNoNutriScore));
+    hideNoNutriScoreLeft.appendChild(hideNoNutriScoreText);
 
-    const hideUnknownCheckbox = document.createElement("input");
-    hideUnknownCheckbox.type = "checkbox";
-    hideUnknownCheckbox.id = "tm-md-hide-unknown";
-    hideUnknownCheckbox.className = "tm-md-check";
-    hideUnknownCheckbox.checked = !!filterOptions.hideUnknown;
+    const hideNoNutriScoreCheckbox = document.createElement("input");
+    hideNoNutriScoreCheckbox.type = "checkbox";
+    hideNoNutriScoreCheckbox.id = "tm-md-hide-no-nutriscore";
+    hideNoNutriScoreCheckbox.className = "tm-md-check";
+    hideNoNutriScoreCheckbox.checked = !!filterOptions.hideNoNutriScore;
 
-    hideUnknownCheckbox.addEventListener("change", () => {
+    hideNoNutriScoreCheckbox.addEventListener("change", () => {
       const current = Utils.getFilterOptions();
-      current.hideUnknown = hideUnknownCheckbox.checked;
+      current.hideNoNutriScore = hideNoNutriScoreCheckbox.checked;
       Utils.setFilterOptions(current);
       Filters.reapplyAll();
     });
 
-    hideUnknownRow.appendChild(hideUnknownLeft);
-    hideUnknownRow.appendChild(hideUnknownCheckbox);
-    menu.appendChild(hideUnknownRow);
+    hideNoNutriScoreRow.appendChild(hideNoNutriScoreLeft);
+    hideNoNutriScoreRow.appendChild(hideNoNutriScoreCheckbox);
+    menu.appendChild(hideNoNutriScoreRow);
+
+    const hideNoInfoRow = document.createElement("label");
+    hideNoInfoRow.className = "tm-md-row";
+    hideNoInfoRow.setAttribute("for", "tm-md-hide-no-info");
+
+    const hideNoInfoLeft = document.createElement("div");
+    hideNoInfoLeft.className = "tm-md-left";
+
+    const hideNoInfoText = document.createElement("span");
+    hideNoInfoText.className = "tm-md-label";
+    hideNoInfoText.textContent = "ocultar alimentos sin información";
+
+    hideNoInfoLeft.appendChild(UI.createHelpIcon(Config.FILTER_HELP.hideNoInfo));
+    hideNoInfoLeft.appendChild(hideNoInfoText);
+
+    const hideNoInfoCheckbox = document.createElement("input");
+    hideNoInfoCheckbox.type = "checkbox";
+    hideNoInfoCheckbox.id = "tm-md-hide-no-info";
+    hideNoInfoCheckbox.className = "tm-md-check";
+    hideNoInfoCheckbox.checked = !!filterOptions.hideNoInfo;
+
+    hideNoInfoCheckbox.addEventListener("change", () => {
+      const current = Utils.getFilterOptions();
+      current.hideNoInfo = hideNoInfoCheckbox.checked;
+      Utils.setFilterOptions(current);
+      Filters.reapplyAll();
+    });
+
+    hideNoInfoRow.appendChild(hideNoInfoLeft);
+    hideNoInfoRow.appendChild(hideNoInfoCheckbox);
+    menu.appendChild(hideNoInfoRow);
 
     const hideGlutenRow = document.createElement("label");
     hideGlutenRow.className = "tm-md-row";
@@ -1271,6 +1515,9 @@ const UI = {
         opacity: 0.9;
         fill: rgba(0,0,0,0.82);
       }
+      .tm-md-badge-suppressed{
+        display: none !important;
+      }
 
       .tm-md-muted{
         filter: grayscale(1);
@@ -1392,6 +1639,15 @@ const UI = {
         flex-direction: column;
         gap: 8px;
       }
+      .tm-md-tip-list.grid{
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-auto-rows: minmax(0, auto);
+        gap: 8px;
+      }
+      .tm-md-tip-list.grid .tm-md-tip-card{
+        align-items: flex-start;
+      }
 
       .tm-md-tip-card{
         display: flex;
@@ -1400,6 +1656,8 @@ const UI = {
         padding: 8px 10px;
         border-radius: 12px;
         background: rgba(255,255,255,0.06);
+        min-width: 0;
+        overflow: hidden;
       }
 
       .tm-md-tip-card-icon{
@@ -1422,9 +1680,12 @@ const UI = {
 
       .tm-md-tip-card-body{
         min-width: 0;
+        width: 100%;
+        flex: 1 1 auto;
         display: flex;
         flex-direction: column;
         gap: 2px;
+        overflow: hidden;
       }
 
       .tm-md-tip-card-label{
@@ -1438,13 +1699,19 @@ const UI = {
         font-size: 13px;
         font-weight: 700;
         line-height: 1.2;
+        width: 100%;
+        min-width: 0;
+        overflow-wrap: anywhere;
+        word-break: break-word;
       }
 
       .tm-md-status{
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        flex-wrap: wrap;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+        width: 100%;
+        min-width: 0;
       }
 
       .tm-md-status-pill{
@@ -1457,6 +1724,9 @@ const UI = {
         font-size: 12px;
         font-weight: 800;
         letter-spacing: 0.01em;
+        max-width: 100%;
+        text-align: center;
+        white-space: normal;
       }
 
       .tm-md-status-pill.safe{
@@ -1488,6 +1758,44 @@ const UI = {
         font-size: 11px;
         font-weight: 600;
         opacity: 0.74;
+        width: 100%;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+
+      .tm-md-chip-list{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 6px;
+        width: 100%;
+        min-width: 0;
+      }
+
+      .tm-md-chip{
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 22px;
+        padding: 0 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+        max-width: 100%;
+        text-align: center;
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+
+      .tm-md-chip.allergen{
+        background: rgba(255, 106, 106, 0.18);
+        color: #ffc0c0;
+      }
+
+      .tm-md-chip.trace{
+        background: rgba(255, 196, 72, 0.18);
+        color: #ffe2a2;
       }
 
       .tm-md-tip-footer{
@@ -1536,8 +1844,9 @@ const UI = {
       .tm-md-spinner-svg circle{
         stroke: white;
         opacity: 0.9;
-        stroke-dasharray: 90;
-        stroke-dashoffset: 50;
+        stroke-dasharray: 36 113;
+        stroke-dashoffset: 0;
+        animation: tm-md-spinner-dash 1.4s ease-in-out infinite;
       }
 
       .tm-md-nutri{
@@ -1575,14 +1884,17 @@ const UI = {
       }
 
       .tm-md-scale{
-        display: inline-flex;
+        display: flex;
         align-items: center;
         gap: 4px;
-        flex-wrap: nowrap;
+        flex-wrap: wrap;
+        width: 100%;
+        min-width: 0;
       }
 
       .tm-md-scale-seg{
         min-width: 18px;
+        max-width: 100%;
         height: 18px;
         padding: 0 6px;
         border-radius: 5px;
@@ -1609,11 +1921,29 @@ const UI = {
         font-size: 11px;
         font-weight: 700;
         opacity: 0.86;
+        width: 100%;
+        min-width: 0;
+        overflow-wrap: anywhere;
       }
 
       @keyframes tm-md-spin {
         from { transform: rotate(0deg); }
         to { transform: rotate(360deg); }
+      }
+
+      @keyframes tm-md-spinner-dash {
+        0% {
+          stroke-dasharray: 12 113;
+          stroke-dashoffset: 0;
+        }
+        50% {
+          stroke-dasharray: 62 113;
+          stroke-dashoffset: -18;
+        }
+        100% {
+          stroke-dasharray: 12 113;
+          stroke-dashoffset: -75;
+        }
       }
     `;
     document.head.appendChild(style);
@@ -1635,11 +1965,64 @@ const UI = {
 
     const offsetX = 14;
     const offsetY = 14;
-    const maxX = window.innerWidth - 380;
-    const maxY = window.innerHeight - 260;
+    const viewportPadding = 16;
+    const list = t.querySelector(".tm-md-tip-list");
+    const cardCount = Number(list?.dataset.cardCount || 0);
+    const hasWarn = !!t.querySelector(".tm-md-tip-warn");
+    const hasFooter = !!t.querySelector(".tm-md-tip-footer");
 
-    t.style.left = Math.min(x + offsetX, maxX) + "px";
-    t.style.top = Math.min(y + offsetY, maxY) + "px";
+    if (list) {
+      list.classList.remove("grid");
+    }
+
+    const availableRight = Math.max(0, window.innerWidth - (x + offsetX) - viewportPadding);
+    const availableLeft = Math.max(0, x - offsetX - viewportPadding);
+    const availableBottom = Math.max(0, window.innerHeight - (y + offsetY) - viewportPadding);
+    const availableTop = Math.max(0, y - offsetY - viewportPadding);
+    const maxAvailableWidth = Math.max(availableRight, availableLeft);
+    const maxAvailableHeight = Math.max(availableBottom, availableTop);
+    const estimatedSingleColumnHeight =
+      56 + cardCount * 74 + (hasWarn ? 34 : 0) + (hasFooter ? 24 : 0);
+
+    const canUseGridWidth = maxAvailableWidth >= 430 && window.innerWidth >= 560;
+    const shouldUseGrid =
+      cardCount >= 2 &&
+      canUseGridWidth &&
+      estimatedSingleColumnHeight > Math.max(280, maxAvailableHeight);
+
+    const targetMaxWidth = Math.min(
+      shouldUseGrid ? 540 : 360,
+      Math.max(260, window.innerWidth - viewportPadding * 2)
+    );
+
+    t.style.maxWidth = `${targetMaxWidth}px`;
+
+    if (list && shouldUseGrid) {
+      list.classList.add("grid");
+    }
+
+    const rect = t.getBoundingClientRect();
+    let left = x + offsetX;
+    let top = y + offsetY;
+
+    if (left + rect.width > window.innerWidth - viewportPadding) {
+      left = x - rect.width - offsetX;
+    }
+    if (top + rect.height > window.innerHeight - viewportPadding) {
+      top = y - rect.height - offsetY;
+    }
+
+    left = Math.min(
+      Math.max(viewportPadding, left),
+      Math.max(viewportPadding, window.innerWidth - rect.width - viewportPadding)
+    );
+    top = Math.min(
+      Math.max(viewportPadding, top),
+      Math.max(viewportPadding, window.innerHeight - rect.height - viewportPadding)
+    );
+
+    t.style.left = `${left}px`;
+    t.style.top = `${top}px`;
   },
 
   hideTooltip() {
@@ -1716,6 +2099,40 @@ const UI = {
     });
   },
 
+  nutrientScaleVisualHtml(value, { lowLabel, mediumLabel, highLabel, lowMax, mediumMax, unit = "g" }) {
+    if (value == null || Number.isNaN(value)) return "";
+    const level = value < lowMax ? "low" : value < mediumMax ? "medium" : "high";
+    return UI.scaleVisualHtml({
+      levels: [
+        { value: "low", label: lowLabel, color: "#f2994a" },
+        { value: "medium", label: mediumLabel, color: "#f2c94c" },
+        { value: "high", label: highLabel, color: "#1e8f4d" },
+      ],
+      activeValue: level,
+      caption: `${value.toFixed(1)} ${unit}/100g`,
+    });
+  },
+
+  allergensVisualHtml(allergensInfo) {
+    const info = allergensInfo || {};
+    const hasAllergens = Array.isArray(info.allergens) && info.allergens.length > 0;
+    const hasTraces = Array.isArray(info.traces) && info.traces.length > 0;
+    if (!hasAllergens && !hasTraces) return UI.infoStatusHtml(allergensInfo);
+
+    const chips = [];
+    for (const tag of info.allergens || []) {
+      chips.push(`<span class="tm-md-chip allergen">${Utils.escapeHtml(Utils.humanizeTag(tag))}</span>`);
+    }
+    for (const tag of info.traces || []) {
+      chips.push(`<span class="tm-md-chip trace">${Utils.escapeHtml(Utils.humanizeTag(tag))}</span>`);
+    }
+
+    return `
+      ${UI.infoStatusHtml(allergensInfo)}
+      <div class="tm-md-chip-list">${chips.join("")}</div>
+    `;
+  },
+
   infoStatusHtml(infoObj) {
     const info = infoObj || {};
     const status = Utils.normalizeDisplayValue(info.status);
@@ -1750,7 +2167,7 @@ const UI = {
     `;
   },
 
-  tooltipHtml({ title, cardsHtml, footer, warn }) {
+  tooltipHtml({ title, cardsHtml, footer, warn, cardCount = 0 }) {
     const safeTitle = Utils.escapeHtml(title);
     const footerHtml = footer ? `<div class="tm-md-tip-footer">${Utils.escapeHtml(footer)}</div>` : "";
     const warnHtml = warn ? `<div class="tm-md-tip-warn">${Utils.escapeHtml(warn)}</div>` : "";
@@ -1758,10 +2175,9 @@ const UI = {
       !cardsHtml && !warn
         ? `<div class="tm-md-empty">No has seleccionado campos en el menú.</div>`
         : "";
-
     return `
       <div class="tm-md-tip-title">${safeTitle}</div>
-      <div class="tm-md-tip-list">
+      <div class="tm-md-tip-list" data-card-count="${Number(cardCount) || 0}">
         ${cardsHtml || emptyHtml}
       </div>
       ${warnHtml}
@@ -1790,6 +2206,31 @@ const Dom = {
     return out;
   },
 
+  isElementVisible(el) {
+    if (!el || !document.body.contains(el)) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      style.opacity !== "0"
+    );
+  },
+
+  findOpenProductDetailRoot() {
+    for (const sel of Config.SELECTORS.detailRoots) {
+      const matches = document.querySelectorAll(sel);
+      for (const el of matches) {
+        if (Dom.isElementVisible(el) && el.querySelector(Config.SELECTORS.productCards.join(", "))) {
+          return el;
+        }
+      }
+    }
+    return null;
+  },
+
   getName(card) {
     for (const sel of Config.SELECTORS.name) {
       const el = card.querySelector(sel);
@@ -1808,11 +2249,17 @@ const Dom = {
   },
 
   resolveProductId(card) {
+    PersistentCache.ensureHydrated();
     const name = Dom.getName(card);
     const brand = Dom.getBrandHint(card);
     const key = Utils.nameKey(name, brand);
 
     if (State.idByNameKey.has(key)) return State.idByNameKey.get(key);
+    const cachedId = PersistentCache.getIdByNameKey(key);
+    if (cachedId) {
+      State.idByNameKey.set(key, String(cachedId));
+      return String(cachedId);
+    }
 
     const m = location.pathname.match(/^\/product\/(\d+)\b/);
     if (m) return m[1];
@@ -1899,9 +2346,11 @@ const Filters = {
 
     const filterOptions = Utils.getFilterOptions();
     const useNutriFilter = filterOptions.threshold !== "none";
+    const hideNoNutriScore = !!filterOptions.hideNoNutriScore;
+    const hideNoInfo = !!filterOptions.hideNoInfo;
     const useGlutenFilter = !!filterOptions.hideGluten;
 
-    if (!useNutriFilter && !useGlutenFilter) {
+    if (!useNutriFilter && !hideNoNutriScore && !hideNoInfo && !useGlutenFilter) {
       Filters.clearCard(card);
       return;
     }
@@ -1931,12 +2380,12 @@ const Filters = {
       return;
     }
 
-    if (!useNutriFilter) {
+    if (!useNutriFilter && !hideNoNutriScore && !hideNoInfo) {
       return;
     }
 
     if (!off.hasOffData) {
-      if (filterOptions.hideUnknown) {
+      if (hideNoInfo) {
         card.classList.add("tm-md-hidden");
       } else {
         card.classList.add("tm-md-no-off");
@@ -1949,7 +2398,7 @@ const Filters = {
     }
 
     if (!Utils.isValidNutriGrade(realGrade)) {
-      if (filterOptions.hideUnknown) {
+      if (hideNoNutriScore) {
         card.classList.add("tm-md-hidden");
       } else {
         card.classList.add("tm-md-unknown");
@@ -1958,6 +2407,10 @@ const Filters = {
           tone: "warning",
         });
       }
+      return;
+    }
+
+    if (!useNutriFilter) {
       return;
     }
 
@@ -2004,6 +2457,7 @@ const Badges = {
       Badges.ensureBadge(card);
       Filters.schedule(card);
     }
+    Badges.syncBadgeVisibility();
   },
 
   ensureBadge(card) {
@@ -2017,6 +2471,17 @@ const Badges = {
       badge.innerHTML = Icons.info;
       card.prepend(badge);
       Badges.attachHover(badge, card);
+    }
+  },
+
+  syncBadgeVisibility() {
+    const detailRoot = Dom.findOpenProductDetailRoot();
+    const badges = document.querySelectorAll(".tm-md-badge");
+
+    for (const badge of badges) {
+      const card = badge.closest(Config.SELECTORS.productCards.join(", "));
+      const shouldHide = !!(detailRoot && card && !detailRoot.contains(card));
+      badge.classList.toggle("tm-md-badge-suppressed", shouldHide);
     }
   },
 
@@ -2082,12 +2547,54 @@ const Badges = {
       );
     }
 
-    if (infoOptions.added_sugars) {
+    if (infoOptions.allergens) {
       cards.push(
         UI.infoCardHtml({
-          icon: Icons.sugar,
-          label: "Azúcares añadidos",
-          valueHtml: UI.infoStatusHtml(Utils.addedSugarsInfoFromValue(off.addedSugarsText, hasOffData)),
+          icon: Icons.allergens,
+          label: "Alérgenos",
+          valueHtml: UI.allergensVisualHtml(
+            hasOffData
+              ? off.allergensInfo
+              : Utils.fieldUnavailableInfo("alergenos", false)
+          ),
+        })
+      );
+    }
+
+    if (infoOptions.fiber) {
+      const fiberMissing = off.fiber100g == null || Number.isNaN(off.fiber100g);
+      cards.push(
+        UI.infoCardHtml({
+          icon: Icons.fiber,
+          label: "Fibra",
+          valueHtml: fiberMissing
+            ? UI.infoStatusHtml(Utils.fiberInfoFromValue(off.fiber100g, hasOffData))
+            : UI.nutrientScaleVisualHtml(off.fiber100g, {
+                lowLabel: "Baja",
+                mediumLabel: "Media",
+                highLabel: "Alta",
+                lowMax: 3,
+                mediumMax: 6,
+              }),
+        })
+      );
+    }
+
+    if (infoOptions.proteins) {
+      const proteinsMissing = off.proteins100g == null || Number.isNaN(off.proteins100g);
+      cards.push(
+        UI.infoCardHtml({
+          icon: Icons.proteins,
+          label: "Proteínas",
+          valueHtml: proteinsMissing
+            ? UI.infoStatusHtml(Utils.proteinsInfoFromValue(off.proteins100g, hasOffData))
+            : UI.nutrientScaleVisualHtml(off.proteins100g, {
+                lowLabel: "Bajas",
+                mediumLabel: "Medias",
+                highLabel: "Altas",
+                lowMax: 5,
+                mediumMax: 10,
+              }),
         })
       );
     }
@@ -2102,7 +2609,10 @@ const Badges = {
       );
     }
 
-    return cards.join("");
+    return {
+      html: cards.join(""),
+      count: cards.length,
+    };
   },
 
   attachHover(badge, card) {
@@ -2188,7 +2698,7 @@ const Badges = {
         }
 
         const off = await API.getOffDataByEan(ean);
-        const cardsHtml = Badges.buildCardsHtml(off, infoOptions);
+        const cardsData = Badges.buildCardsHtml(off, infoOptions);
 
         let warn = "";
         if (!off.hasOffData) {
@@ -2202,7 +2712,8 @@ const Badges = {
           ev.clientY,
           UI.tooltipHtml({
             title: name,
-            cardsHtml,
+            cardsHtml: cardsData.html,
+            cardCount: cardsData.count,
             warn,
             footer: `EAN: ${ean}`,
           })
@@ -2238,6 +2749,7 @@ const Badges = {
 /* <---------------------> */
 const Main = {
   init() {
+    PersistentCache.hydrateStateFromLocalStorage();
     Indexer.hookFetch();
 
     document.addEventListener("DOMContentLoaded", () => {
