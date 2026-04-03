@@ -61,6 +61,8 @@ La extensión ha sido diseñada con un enfoque de minimización:
 - ausencia de monetización;
 - ausencia de código remoto cargado dinámicamente.
 
+La información tratada por `NutriVisor` se utiliza exclusivamente para prestar la funcionalidad informativa de la extensión dentro de la web objetivo. No se utiliza para publicidad, perfilado, venta de datos ni fines comerciales.
+
 ## 8. Finalidad académica y no lucrativa
 
 `NutriVisor` se distribuye como parte de un proyecto académico y sin ánimo de lucro. Su propósito es explorar cómo la web aumentada y los datos abiertos pueden mejorar la comprensión de información alimentaria en contextos de compra online.
