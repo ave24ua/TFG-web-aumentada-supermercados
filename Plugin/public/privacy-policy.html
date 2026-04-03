@@ -150,11 +150,10 @@
         display: flex;
         flex-direction: column;
         gap: 18px;
+        align-self: start;
       }
 
       .toc {
-        position: sticky;
-        top: 20px;
         padding: 22px;
       }
 
@@ -260,10 +259,6 @@
       @media (max-width: 920px) {
         .layout {
           grid-template-columns: 1fr;
-        }
-
-        .toc {
-          position: static;
         }
       }
 
